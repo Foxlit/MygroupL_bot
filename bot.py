@@ -3,6 +3,7 @@ import json
 import re
 import time
 import logging
+import threading
 from datetime import datetime
 from functools import wraps
 from dotenv import load_dotenv
@@ -31,6 +32,8 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS")
+SHEET_KEY = os.environ.get("SHEET_KEY")
+SHEET_WORKSHEET = os.environ.get("SHEET_WORKSHEET", "1 вариант")
 
 if not TELEGRAM_TOKEN:
     logger.error("❌ TELEGRAM_BOT_TOKEN не найден в .env файле!")
@@ -40,19 +43,54 @@ if not GOOGLE_CREDS_JSON:
     logger.error("❌ GOOGLE_CREDENTIALS не найден в .env файле!")
     exit(1)
 
+if not SHEET_KEY:
+    logger.error("❌ SHEET_KEY не найден в .env файле!")
+    exit(1)
+
 # ========== КОНСТАНТЫ ==========
 ITEMS_PER_PAGE = 5
 REQUEST_COOLDOWN = 5
-CACHE_TTL = 60  # Кэш на 1 минуту, чтобы не грузить часто
+CACHE_TTL = 60  # Кэш на 1 минуту
 
-# Глобальный кэш для данных (чтобы не грузить с таблицы каждому пользователю)
+# Глобальный кэш
 _data_cache = {
     'data': None,
     'timestamp': 0
 }
 
 user_last_request = {}
-user_state = {}  # Словарь для отслеживания состояния пользователя
+user_state = {}
+
+# ========== УНИФИЦИРОВАННЫЕ СООБЩЕНИЯ ==========
+MESSAGES = {
+    'start': "Напишите /start для перезапуска",
+    'hw': "Напишите /hw для загрузки заданий",
+    'help': "Напишите /help для помощи",
+    'error': "❌ Ошибка. Напишите /start для перезапуска",
+    'no_data': "📭 Данные не загружены. Напишите /hw",
+    'cooldown': "⏳ Подождите {} секунд перед следующим запросом"
+}
+
+# ========== СОСТОЯНИЯ ПОЛЬЗОВАТЕЛЕЙ ==========
+USER_STATES = {
+    'main_menu': '🏠 ГЛАВНОЕ МЕНЮ',
+    'tasks_list': '📚 СПИСОК ЗАДАНИЙ',
+    'help_main': '❓ ПОМОЩЬ (главная)',
+    'help_tasks': '❓ ПОМОЩЬ (задания)',
+    'filter_today': '📅 ФИЛЬТР: СЕГОДНЯ',
+    'filter_overdue': '⚠️ ФИЛЬТР: ПРОСРОЧКА',
+}
+
+
+def set_user_state(user_id, state, page=None):
+    """Устанавливает состояние пользователя с красивым логированием"""
+    if page is not None and state == 'page':
+        state_key = f'page_{page}'
+        user_state[user_id] = state_key
+        logger.info(f"📍 📄 СТРАНИЦА {page}")
+    else:
+        user_state[user_id] = state
+        logger.info(f"📍 {USER_STATES.get(state, 'НЕИЗВЕСТНОЕ СОСТОЯНИЕ')}")
 
 
 # ========== ДЕКОРАТОРЫ ==========
@@ -83,15 +121,52 @@ def async_timer_decorator(func):
 # ========== ФУНКЦИИ ДЛЯ РАБОТЫ С GOOGLE SHEETS ==========
 
 def parse_hyperlink_formula(formula):
-    """Извлекает URL и текст из формулы ГИПЕРССЫЛКА"""
+    """Извлекает URL и текст из формулы ГИПЕРССЫЛКА (поддержка EN и RU)"""
     if not formula or not isinstance(formula, str):
         return None, None
 
-    pattern = r'=HYPERLINK\("([^"]+)";\s*"([^"]*)"\)'
-    match = re.search(pattern, formula)
+    # Отладочный вывод для понимания, что приходит
+    if formula and ('HYPERLINK' in formula or 'ГИПЕРССЫЛКА' in formula):
+        logger.debug(f"🔍 Парсинг формулы: {formula[:100]}...")
 
-    if match:
-        return match.group(1), match.group(2)
+    # Паттерны для разных вариантов
+    patterns = [
+        # Русский вариант с точкой с запятой
+        r'=ГИПЕРССЫЛКА\("([^"]+)";\s*"([^"]*)"\)',
+        # Английский вариант с точкой с запятой
+        r'=HYPERLINK\("([^"]+)";\s*"([^"]*)"\)',
+        # Английский вариант с запятой
+        r'=HYPERLINK\("([^"]+)",\s*"([^"]*)"\)',
+        # Без кавычек для текста (редкий случай)
+        r'=HYPERLINK\("([^"]+)",\s*([^)]+)\)',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, formula)
+        if match:
+            url = match.group(1)
+            text = match.group(2)
+            # Если текст без кавычек, убираем лишние пробелы
+            if text and not text.startswith('"'):
+                text = text.strip()
+            logger.debug(f"✅ Найдена ссылка: {url[:30]}... -> {text[:30]}...")
+            return url, text
+
+    # Упрощенный парсинг на случай, если паттерны не сработали
+    try:
+        # Ищем URL в кавычках
+        url_match = re.search(r'"([^"]+)"', formula)
+        if url_match:
+            url = url_match.group(1)
+            # Ищем текст после разделителя
+            text_match = re.search(r'[;,]\s*"([^"]+)"', formula)
+            text = text_match.group(1) if text_match else "Ссылка"
+            logger.debug(f"✅ Упрощенный парсинг: {url[:30]}...")
+            return url, text
+    except:
+        pass
+
+    logger.warning(f"⚠️ Не удалось распарсить формулу: {formula[:50]}...")
     return None, None
 
 
@@ -115,8 +190,8 @@ def get_homework_fast(force_refresh=False):
         client = gspread.authorize(creds)
 
         # Открываем таблицу
-        spreadsheet = client.open_by_key("1vIxyMIs08MWVOtmuz9dh4O2CVwRINXmxaQnJBObgOFY")
-        sheet = spreadsheet.worksheet("1 вариант")
+        spreadsheet = client.open_by_key(SHEET_KEY)
+        sheet = spreadsheet.worksheet(SHEET_WORKSHEET)
 
         # ВСЕГО 1 ЗАПРОС! Получаем всё одним махом
         all_values = sheet.get_all_values()
@@ -140,7 +215,7 @@ def get_homework_fast(force_refresh=False):
                     value = row[i]
 
                 # Проверяем, не является ли значение формулой гиперссылки
-                if header == "Задание" and value and 'HYPERLINK' in value:
+                if header == "Задание" and value and ('HYPERLINK' in value or 'ГИПЕРССЫЛКА' in value):
                     url, text = parse_hyperlink_formula(value)
                     if url:
                         record[header] = {
@@ -169,6 +244,27 @@ def get_homework_fast(force_refresh=False):
     except Exception as e:
         logger.error(f"❌ Ошибка: {e}", exc_info=True)
         return []
+
+
+# ========== ФОНОВОЕ ОБНОВЛЕНИЕ ==========
+def background_cache_updater():
+    """Фоновая задача для обновления кэша в отдельном потоке"""
+    global _data_cache
+
+    while True:
+        try:
+            time.sleep(60)  # Ждём минуту
+            logger.info("🔄 Фоновое обновление кэша (поток)...")
+
+            new_data = get_homework_fast(force_refresh=True)
+            if new_data:
+                _data_cache['data'] = new_data
+                _data_cache['timestamp'] = time.time()
+                logger.info(f"✅ Кэш обновлён: {len(new_data)} записей")
+            else:
+                logger.warning("⚠️ Не удалось обновить кэш")
+        except Exception as e:
+            logger.error(f"❌ Ошибка фонового обновления: {e}")
 
 
 # ========== ФУНКЦИИ ФОРМАТИРОВАНИЯ ==========
@@ -251,11 +347,10 @@ def format_homework_page(records, page=0):
     if nav_buttons:
         keyboard.append(nav_buttons)
 
-    # Кнопки действий
+    # Кнопки действий (без просрочки)
     filter_buttons = [
         InlineKeyboardButton("🔄 Обновить", callback_data="refresh_data"),
-        InlineKeyboardButton("📅 Сегодня", callback_data="filter_today"),
-        InlineKeyboardButton("⚠️ Просрочка", callback_data="filter_overdue")
+        InlineKeyboardButton("📅 Сегодня", callback_data="filter_today")
     ]
     keyboard.append(filter_buttons)
 
@@ -277,10 +372,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = user.username or user.first_name
 
     logger.info(f"👤 Пользователь @{username} (ID: {user_id}) вызвал команду /start")
-
-    # Записываем состояние
-    user_state[user_id] = 'main_menu'
-    logger.info(f"📍 Состояние пользователя {username}: ГЛАВНОЕ МЕНЮ")
+    set_user_state(user_id, 'main_menu')
 
     # Главное меню
     keyboard = [
@@ -300,6 +392,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help - показывает подробную помощь"""
     user = update.effective_user
+    user_id = user.id
     username = user.username or user.first_name
 
     logger.info(f"👤 Пользователь @{username} вызвал команду /help")
@@ -309,22 +402,26 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Основные команды:</b>\n"
         "• /hw - показать домашнее задание\n"
         "• /help - показать это сообщение\n"
-        "• /start - главное меню\n\n"
+        "• /start - главное меню\n"
+        "• /overdue - показать просроченные задания\n\n"
 
         "<b>Как пользоваться:</b>\n"
-        "1. Нажми /hw или кнопку '📚 Показать задания'\n"
-        "2. Листай страницы кнопками ◀️ Назад / Вперед ▶️\n"
-        "3. Используй фильтры для быстрого поиска:\n"
+        "1. Напишите /hw или нажмите кнопку '📚 Показать задания'\n"
+        "2. Листайте страницы кнопками ◀️ Назад / Вперед ▶️\n"
+        "3. Используйте фильтры для быстрого поиска:\n"
         "   • 📅 Сегодня - задания на сегодня\n"
-        "   • ⚠️ Просрочка - просроченные задания\n"
         "   • 🔄 Обновить - загрузить свежие данные\n\n"
+
+        "<b>Что означают статусы:</b>\n"
+        "• 🔥 СЕГОДНЯ! - сдать сегодня\n"
+        "• ⚠️ ЗАВТРА! - сдать завтра\n"
+        "• ⏰ N дн. - осталось N дней\n"
+        "• ❗️ ПРОСРОЧЕНО - задание просрочено\n\n"
 
         "<b>Дополнительно:</b>\n"
         "• Ссылки в заданиях кликабельны (синий текст)\n"
-        "• Данные берутся из Google таблицы с домашними заданиями группы\n"
-        "• Бот обновляет данные раз в минуту\n\n"
-
-        "Если что-то не работает - напиши /start для перезапуска"
+        "• Данные обновляются автоматически каждую минуту\n"
+        "• Если что-то не работает - напишите /start для перезапуска"
     )
 
     keyboard = [[InlineKeyboardButton("🏠 В главное меню", callback_data="main_menu")]]
@@ -336,6 +433,48 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup,
         disable_web_page_preview=True
     )
+
+
+async def overdue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /overdue - показать просроченные задания"""
+    user = update.effective_user
+    user_id = user.id
+    username = user.username or user.first_name
+
+    logger.info(f"👤 Пользователь @{username} вызвал команду /overdue")
+
+    homework_data = get_homework_fast(force_refresh=False)
+
+    if not homework_data:
+        await update.message.reply_text(f"📭 Нет данных о заданиях. {MESSAGES['hw']}")
+        return
+
+    today = datetime.now().date()
+    filtered = []
+    for item in homework_data:
+        date_str = item.get('Срок', '')
+        if date_str:
+            try:
+                due = datetime.strptime(date_str, "%d.%m.%Y").date()
+                if due < today:
+                    filtered.append(item)
+            except:
+                pass
+
+    if filtered:
+        set_user_state(user_id, 'filter_overdue')
+        message, keyboard = format_homework_page(filtered, 0)
+        keyboard.append([InlineKeyboardButton("◀️ Все задания", callback_data="show_hw")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            f"⚠️ <b>Просроченные задания ({len(filtered)}):</b>\n\n{message}",
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+            disable_web_page_preview=True
+        )
+    else:
+        await update.message.reply_text("✅ Просроченных заданий нет!")
 
 
 @async_timer_decorator
@@ -353,7 +492,7 @@ async def homework_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         time_diff = current_time - user_last_request[user_id]
         if time_diff < REQUEST_COOLDOWN:
             await update.message.reply_text(
-                f"⏳ Подожди {REQUEST_COOLDOWN - time_diff:.0f} секунд"
+                MESSAGES['cooldown'].format(REQUEST_COOLDOWN - time_diff)
             )
             return
 
@@ -362,13 +501,11 @@ async def homework_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action(action="typing")
 
     try:
-        # Загружаем данные (force_refresh=True чтобы получить свежие)
+        # Загружаем данные
         homework_data = get_homework_fast(force_refresh=True)
 
         if homework_data:
-            # Записываем состояние
-            user_state[user_id] = 'tasks_list'
-            logger.info(f"📍 Состояние пользователя {username}: СПИСОК ЗАДАНИЙ")
+            set_user_state(user_id, 'tasks_list')
 
             message, keyboard = format_homework_page(homework_data, 0)
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -380,15 +517,15 @@ async def homework_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True
             )
 
-            # Сохраняем данные
             context.user_data['homework_data'] = homework_data
             context.user_data['current_page'] = 0
+            context.user_data['last_update'] = time.time()
         else:
             await update.message.reply_text("📭 В таблице нет заданий!")
 
     except Exception as e:
         logger.error(f"❌ Ошибка: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Ошибка: {str(e)[:100]}")
+        await update.message.reply_text(f"❌ Ошибка. {MESSAGES['start']}")
 
 
 # ========== ОБРАБОТЧИК КНОПОК ==========
@@ -411,18 +548,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         # ===== КНОПКИ ГЛАВНОГО МЕНЮ =====
         if data == "help_main":
-            logger.info(f"ℹ️ Пользователь {username} открыл помощь (главное меню)")
+            set_user_state(user_id, 'help_main')
 
             help_text = (
                 "📚 <b>Помощь по боту</b>\n\n"
                 "<b>Что я умею:</b>\n"
-                "• Показывать домашние задания из таблицы\n\n"
+                "• Показывать домашние задания из таблицы\n"
+                "• Отображать гиперссылки в заданиях\n"
+                "• Фильтровать по срокам\n\n"
                 "<b>Команды:</b>\n"
-                "/hw - показать задания\n"
-                "/help - открыть это меню\n"
-                "/start - перезапуск бота\n\n"
+                "/hw - сразу показать задания\n"
+                "/help - подробная помощь\n"
+                "/start - главное меню\n"
+                "/overdue - просроченные задания\n\n"
                 "<b>Навигация:</b>\n"
-                "🏠 Главное меню - вернуться в главное меню"
+                "🏠 Главное меню - вернуться сюда"
             )
 
             keyboard = [[InlineKeyboardButton("🏠 В главное меню", callback_data="main_menu")]]
@@ -436,9 +576,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         elif data == "main_menu":
-            # Возврат в главное меню
             logger.info(f"🏠 Пользователь {username} вернулся в главное меню")
-            user_state[user_id] = 'main_menu'
+            set_user_state(user_id, 'main_menu')
 
             keyboard = [
                 [InlineKeyboardButton("📚 Показать задания", callback_data="show_hw")],
@@ -457,12 +596,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await query.edit_message_text("⚡ Загружаю данные...")
 
-            # Загружаем свежие данные
             homework_data = get_homework_fast(force_refresh=True)
 
             if homework_data:
-                user_state[user_id] = 'tasks_list'
-                logger.info(f"📍 Новое состояние: СПИСОК ЗАДАНИЙ")
+                set_user_state(user_id, 'tasks_list')
 
                 message, keyboard = format_homework_page(homework_data, 0)
                 reply_markup = InlineKeyboardMarkup(keyboard)
@@ -476,11 +613,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 context.user_data['homework_data'] = homework_data
                 context.user_data['current_page'] = 0
+                context.user_data['last_update'] = time.time()
             else:
                 await query.edit_message_text("📭 В таблице нет заданий!")
 
         elif data == "help_tasks":
-            logger.info(f"ℹ️ Пользователь {username} открыл помощь (список заданий)")
+            set_user_state(user_id, 'help_tasks')
 
             help_text = (
                 "📚 <b>Работа с заданиями</b>\n\n"
@@ -488,13 +626,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "◀️ Назад / Вперед ▶️ - листать страницы\n"
                 "🔄 Обновить - загрузить свежие данные\n"
                 "📅 Сегодня - показать задания на сегодня\n"
-                "⚠️ Просрочка - показать просроченные\n"
                 "🏠 Главное меню - вернуться в начало\n\n"
                 "<b>Статусы:</b>\n"
                 "🔥 СЕГОДНЯ! - сдать сегодня\n"
                 "⚠️ ЗАВТРА! - сдать завтра\n"
                 "⏰ N дн. - осталось N дней\n"
-                "❗️ ПРОСРОЧЕНО - задание просрочено"
+                "❗️ ПРОСРОЧЕНО - задание просрочено\n\n"
+                f"{MESSAGES['help']}"
             )
 
             keyboard = [[InlineKeyboardButton("◀️ Назад к заданиям", callback_data="back_to_tasks")]]
@@ -508,14 +646,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         elif data == "back_to_tasks":
-            # Возврат к списку заданий
             logger.info(f"◀️ Пользователь {username} вернулся к заданиям")
 
+            # Проверяем, не устарели ли данные
             homework_data = context.user_data.get('homework_data', [])
             current_page = context.user_data.get('current_page', 0)
+            last_update = context.user_data.get('last_update', 0)
+
+            # Если данные старше 5 минут или их нет - загружаем свежие
+            if not homework_data or (time.time() - last_update) > 300:  # 5 минут
+                logger.info("📦 Данные устарели, загружаю свежие...")
+                await query.edit_message_text("🔄 Обновляю данные...")
+                homework_data = get_homework_fast(force_refresh=True)
+                if homework_data:
+                    context.user_data['homework_data'] = homework_data
+                    context.user_data['last_update'] = time.time()
+                    context.user_data['current_page'] = 0
+                    current_page = 0
 
             if homework_data:
-                user_state[user_id] = 'tasks_list'
+                set_user_state(user_id, 'tasks_list')
                 message, keyboard = format_homework_page(homework_data, current_page)
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -526,9 +676,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     disable_web_page_preview=True
                 )
             else:
-                # Если данных нет, предлагаем загрузить
                 await query.edit_message_text(
-                    "📭 Данные не загружены. Нажмите кнопку ниже:",
+                    f"📭 Данные не загружены. {MESSAGES['hw']}",
                     reply_markup=InlineKeyboardMarkup([[
                         InlineKeyboardButton("📚 Загрузить задания", callback_data="show_hw")
                     ]])
@@ -539,10 +688,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await query.edit_message_text("🔄 Обновляю данные из таблицы...")
 
-            # Принудительно загружаем свежие данные
             new_data = get_homework_fast(force_refresh=True)
 
             if new_data:
+                set_user_state(user_id, 'tasks_list')
+
                 message, keyboard = format_homework_page(new_data, 0)
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -555,6 +705,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 context.user_data['homework_data'] = new_data
                 context.user_data['current_page'] = 0
+                context.user_data['last_update'] = time.time()
 
                 logger.info(f"✅ Данные обновлены для {username}")
             else:
@@ -573,7 +724,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if not homework_data:
                 await query.edit_message_text(
-                    "📭 Сначала загрузите данные:",
+                    f"📭 Сначала загрузите данные. {MESSAGES['hw']}",
                     reply_markup=InlineKeyboardMarkup([[
                         InlineKeyboardButton("📚 Загрузить задания", callback_data="show_hw")
                     ]])
@@ -581,7 +732,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             context.user_data['current_page'] = page
-            user_state[user_id] = 'tasks_list'
+            set_user_state(user_id, 'page', page=page)
 
             message, keyboard = format_homework_page(homework_data, page)
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -600,7 +751,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if not homework_data:
                 await query.edit_message_text(
-                    "📭 Сначала загрузите данные:",
+                    f"📭 Сначала загрузите данные. {MESSAGES['hw']}",
                     reply_markup=InlineKeyboardMarkup([[
                         InlineKeyboardButton("📚 Загрузить задания", callback_data="show_hw")
                     ]])
@@ -620,6 +771,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pass
 
             if filtered:
+                set_user_state(user_id, 'filter_today')
                 message, keyboard = format_homework_page(filtered, 0)
                 current_page = context.user_data.get('current_page', 0)
                 keyboard.append([InlineKeyboardButton("◀️ Все задания", callback_data=f"page_{current_page}")])
@@ -636,54 +788,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True
             )
 
-        elif data == "filter_overdue":
-            logger.info(f"⚠️ Пользователь {username} фильтрует: просрочка")
-
-            homework_data = context.user_data.get('homework_data', [])
-
-            if not homework_data:
-                await query.edit_message_text(
-                    "📭 Сначала загрузите данные:",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("📚 Загрузить задания", callback_data="show_hw")
-                    ]])
-                )
-                return
-
-            today = datetime.now().date()
-            filtered = []
-            for item in homework_data:
-                date_str = item.get('Срок', '')
-                if date_str:
-                    try:
-                        due = datetime.strptime(date_str, "%d.%m.%Y").date()
-                        if due < today:
-                            filtered.append(item)
-                    except:
-                        pass
-
-            if filtered:
-                message, keyboard = format_homework_page(filtered, 0)
-                current_page = context.user_data.get('current_page', 0)
-                keyboard.append([InlineKeyboardButton("◀️ Все задания", callback_data=f"page_{current_page}")])
-            else:
-                message = "✅ Просроченных заданий нет!"
-                current_page = context.user_data.get('current_page', 0)
-                keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data=f"page_{current_page}")]]
-
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(
-                message,
-                parse_mode="HTML",
-                reply_markup=reply_markup,
-                disable_web_page_preview=True
-            )
-
     except Exception as e:
         logger.error(f"❌ Ошибка в кнопке {data}: {e}", exc_info=True)
         try:
             await query.edit_message_text(
-                "❌ Произошла ошибка. Напишите /start",
+                f"❌ Произошла ошибка. {MESSAGES['start']}",
                 disable_web_page_preview=True
             )
         except:
@@ -695,21 +804,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Главная функция запуска бота"""
     logger.info("=" * 60)
-    logger.info("🚀 ЗАПУСК БОТА С ОТСЛЕЖИВАНИЕМ СОСТОЯНИЙ")
+    logger.info("🚀 ЗАПУСК ФИНАЛЬНОЙ ВЕРСИИ БОТА")
     logger.info("=" * 60)
 
     logger.info(f"📊 Настройки:")
     logger.info(f"  • Токен: {TELEGRAM_TOKEN[:10]}... (скрыт)")
     logger.info(f"  • Google Sheets: подключен")
+    logger.info(f"  • Ключ таблицы: {SHEET_KEY[:10]}... (скрыт)")
+    logger.info(f"  • Лист: {SHEET_WORKSHEET}")
     logger.info(f"  • Элементов на странице: {ITEMS_PER_PAGE}")
     logger.info(f"  • Время жизни кэша: {CACHE_TTL} сек")
     logger.info(f"  • Защита от спама: {REQUEST_COOLDOWN} сек")
 
+    # Запускаем фоновое обновление в отдельном потоке
+    updater_thread = threading.Thread(target=background_cache_updater, daemon=True)
+    updater_thread.start()
+    logger.info("✅ Фоновое обновление запущено в отдельном потоке")
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # Добавляем обработчики команд
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("hw", homework_command))
+    app.add_handler(CommandHandler("overdue", overdue_command))
     app.add_handler(CallbackQueryHandler(button_handler))
 
     logger.info("✅ Обработчики команд зарегистрированы")
