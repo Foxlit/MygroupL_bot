@@ -298,8 +298,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /help"""
-    await start(update, context)
+    """Обработчик команды /help - показывает подробную помощь"""
+    user = update.effective_user
+    username = user.username or user.first_name
+
+    logger.info(f"👤 Пользователь @{username} вызвал команду /help")
+
+    help_text = (
+        "📚 <b>Помощь по боту</b>\n\n"
+        "<b>Основные команды:</b>\n"
+        "• /hw - показать домашнее задание\n"
+        "• /help - показать это сообщение\n"
+        "• /start - главное меню\n\n"
+
+        "<b>Как пользоваться:</b>\n"
+        "1. Нажми /hw или кнопку '📚 Показать задания'\n"
+        "2. Листай страницы кнопками ◀️ Назад / Вперед ▶️\n"
+        "3. Используй фильтры для быстрого поиска:\n"
+        "   • 📅 Сегодня - задания на сегодня\n"
+        "   • ⚠️ Просрочка - просроченные задания\n"
+        "   • 🔄 Обновить - загрузить свежие данные\n\n"
+
+        "<b>Дополнительно:</b>\n"
+        "• Ссылки в заданиях кликабельны (синий текст)\n"
+        "• Данные берутся из Google таблицы с домашними заданиями группы\n"
+        "• Бот обновляет данные раз в минуту\n\n"
+
+        "Если что-то не работает - напиши /start для перезапуска"
+    )
+
+    keyboard = [[InlineKeyboardButton("🏠 В главное меню", callback_data="main_menu")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        help_text,
+        parse_mode="HTML",
+        reply_markup=reply_markup,
+        disable_web_page_preview=True
+    )
 
 
 @async_timer_decorator
@@ -382,10 +418,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "<b>Что я умею:</b>\n"
                 "• Показывать домашние задания из таблицы\n\n"
                 "<b>Команды:</b>\n"
-                "/hw - сразу показать задания\n"
-                "/start - главное меню\n\n"
+                "/hw - показать задания\n"
+                "/help - открыть это меню\n"
+                "/start - перезапуск бота\n\n"
                 "<b>Навигация:</b>\n"
-                "🏠 Главное меню - вернуться сюда"
+                "🏠 Главное меню - вернуться в главное меню"
             )
 
             keyboard = [[InlineKeyboardButton("🏠 В главное меню", callback_data="main_menu")]]
