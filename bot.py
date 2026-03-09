@@ -405,7 +405,7 @@ async def daily_update_job(context: ContextTypes.DEFAULT_TYPE):
 
 # ========== ФУНКЦИИ ФОРМАТИРОВАНИЯ ==========
 
-def check_for_updates(context):
+def check_for_updates(context, user_id):
     """Проверяет, есть ли обновления для пользователя"""
     user_version = context.user_data.get('data_version', 0)
     current_version = _data_cache.get('version', 0)
@@ -455,7 +455,7 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
         due_date = item.get('Срок', '')
         task_data = item.get('Задание', 'Нет описания')
 
-        status_emoji = "⏳"
+        status_emoji = ""
         if due_date:
             try:
                 due = datetime.strptime(due_date, "%d.%m.%Y")
@@ -622,7 +622,6 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 Привет, {user.first_name}!\n\n"
         "Я бот для отслеживания домашних заданий и ссылок.\n"
-        f"📍 Московское время: {format_moscow_time()}\n"
         "Выбери действие:",
         reply_markup=reply_markup
     )
@@ -658,7 +657,6 @@ async def help_command(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "• Задания обновляются ежедневно в 00:00 МСК\n"
         "• Дата последнего обновления показывается сверху\n"
         "• При ошибке показываются предыдущие данные\n\n"
-        f"🕐 Текущее время МСК: {format_moscow_time()}"
     )
 
     keyboard = [[InlineKeyboardButton("🏠 В главное меню", callback_data="main_menu")]]
@@ -755,7 +753,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "<b>Команды:</b>\n"
                 "/hw - показать задания\n"
                 "/links - показать ссылки\n"
-                "/start - главное меню\n\n"
+                "/start - главное меню\n"
+                "/help - подробная справка\n\n"
+                
                 "<b>Навигация:</b>\n"
                 "🏠 Главное меню - вернуться на главную"
             )
@@ -852,17 +852,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_user_state(user_id, 'HELP_TASKS')
 
             help_text = (
-                "📚 <b>Работа с заданиями</b>\n\n"
-                "<b>Кнопки:</b>\n"
-                "◀️ Назад / Вперед ▶️ - листать страницы\n"
-                "🔄 Обновить - загрузить свежие данные\n"
-                "📅 Сегодня - показать задания на сегодня\n"
-                "🏠 Главное меню - вернуться в начало\n\n"
-                "<b>Статусы:</b>\n"
-                "🔥 СЕГОДНЯ! - сдать сегодня\n"
-                "⚠️ ЗАВТРА! - сдать завтра\n"
-                "⏰ N дн. - осталось N дней\n"
-                "❗️ ПРОСРОЧЕНО - задание просрочено"
+                "📚 <b>Помощь по боту</b>\n\n"
+                "<b>Что я умею:</b>\n"
+                "• Показывать домашние задания из таблицы\n"
+                "• Отображать гиперссылки в заданиях\n"
+                "• Присылать ссылки\n"
+                "• Фильтровать по срокам\n\n"
+
+                "<b>Команды:</b>\n"
+                "/hw - показать задания\n"
+                "/links - показать ссылки\n"
+                "/start - главное меню\n"
+                "/help - подробная справка"
             )
 
             keyboard = [[InlineKeyboardButton("◀️ Назад к заданиям", callback_data="back_to_tasks")]]
