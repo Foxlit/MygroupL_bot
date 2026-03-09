@@ -8,11 +8,11 @@ import asyncio
 from datetime import datetime, timedelta
 from functools import wraps
 from dotenv import load_dotenv
-import pytz  # Добавляем pytz для работы с часовыми поясами
+import pytz
 
 import gspread
 from google.oauth2.service_account import Credentials
-from google.auth.exceptions import GoogleAuthError
+from google.auth.exceptions import GoogleAuthError, RefreshError
 from googleapiclient.errors import HttpError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -65,13 +65,14 @@ REQUEST_COOLDOWN = 5
 CACHE_TTL = 300  # Кэш на 5 минут
 CHECK_INTERVAL = 60  # Проверка обновлений каждую минуту
 
-# Глобальный кэш
+# Глобальный кэш с блокировкой для потокобезопасности
 _data_cache = {
     'data': None,
     'timestamp': 0,
     'version': 0,
     'last_successful_data': None
 }
+_cache_lock = threading.Lock()  # Для безопасного доступа из разных потоков
 
 user_last_request = {}
 user_state = {}
@@ -197,10 +198,29 @@ def parse_hyperlink_formula(formula):
             text_match = re.search(r'[;,]\s*"([^"]+)"', formula)
             text = text_match.group(1) if text_match else "Ссылка"
             return url, text
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Ошибка парсинга ссылки: {e}")
         pass
 
     return None, None
+
+
+def sync_windows_time():
+    """Пытается синхронизировать время в Windows"""
+    try:
+        import platform
+        import subprocess
+        if platform.system() == "Windows":
+            logger.info("🔄 Синхронизация времени Windows...")
+            result = subprocess.run("w32tm /resync", shell=True, capture_output=True, text=True)
+            if result.returncode == 0:
+                logger.info("✅ Синхронизация времени выполнена")
+                return True
+            else:
+                logger.warning(f"⚠️ Ошибка синхронизации: {result.stderr}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при синхронизации времени: {e}")
+    return False
 
 
 @safe_api_call(default_return=[])
@@ -209,9 +229,11 @@ def get_homework_fast(force_refresh=False):
     """Загрузка данных из Google Sheets с сохранением последней успешной версии"""
     global _data_cache
 
-    if not force_refresh and _data_cache['data'] and (time.time() - _data_cache['timestamp']) < CACHE_TTL:
-        logger.info("📦 Использую кэшированные данные")
-        return _data_cache['data']
+    # Проверяем кэш (с блокировкой для потокобезопасности)
+    with _cache_lock:
+        if not force_refresh and _data_cache['data'] and (time.time() - _data_cache['timestamp']) < CACHE_TTL:
+            logger.info("📦 Использую кэшированные данные")
+            return _data_cache['data']
 
     logger.info("⚡ Загрузка из Google Sheets...")
 
@@ -229,7 +251,8 @@ def get_homework_fast(force_refresh=False):
 
         if len(all_values) < 2:
             logger.warning("⚠️ В таблице только заголовки")
-            _data_cache['timestamp'] = time.time()
+            with _cache_lock:
+                _data_cache['timestamp'] = time.time()
             return _data_cache.get('last_successful_data', [])
 
         headers = all_values[0]
@@ -271,32 +294,46 @@ def get_homework_fast(force_refresh=False):
                                 record[header] = str(value)
                         else:
                             record[header] = str(value)
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"Ошибка преобразования даты: {e}")
                         record[header] = str(value)
                 else:
                     record[header] = value
 
             records.append(record)
 
-        _data_cache['last_successful_data'] = records
-        _data_cache['data'] = records
-        _data_cache['timestamp'] = time.time()
-        _data_cache['version'] += 1
-
         hyperlink_count = sum(1 for r in records
                               if isinstance(r.get('Задание'), dict)
                               and r['Задание'].get('is_hyperlink'))
+
+        # Обновляем кэш (с блокировкой)
+        with _cache_lock:
+            _data_cache['last_successful_data'] = records
+            _data_cache['data'] = records
+            _data_cache['timestamp'] = time.time()
+            _data_cache['version'] += 1
 
         logger.info(f"✅ Загружено: {len(records)} записей, {hyperlink_count} гиперссылок")
         logger.info(f"📅 Время данных: {format_moscow_time()}")
 
         return records
 
+    except (GoogleAuthError, HttpError, RefreshError) as e:
+        logger.error(f"❌ Ошибка авторизации Google: {e}")
+        if "invalid_grant" in str(e):
+            logger.warning("⚠️ Обнаружена ошибка времени, пробую синхронизировать...")
+            sync_windows_time()
+        with _cache_lock:
+            if _data_cache.get('last_successful_data'):
+                logger.info("📦 Возвращаю последние успешные данные")
+                return _data_cache['last_successful_data']
+        raise
     except Exception as e:
-        logger.error(f"❌ Ошибка загрузки: {e}")
-        if _data_cache.get('last_successful_data'):
-            logger.info("📦 Возвращаю последние успешные данные")
-            return _data_cache['last_successful_data']
+        logger.error(f"❌ Неизвестная ошибка: {e}")
+        with _cache_lock:
+            if _data_cache.get('last_successful_data'):
+                logger.info("📦 Возвращаю последние успешные данные")
+                return _data_cache['last_successful_data']
         raise
 
 
@@ -368,7 +405,7 @@ async def daily_update_job(context: ContextTypes.DEFAULT_TYPE):
 
 # ========== ФУНКЦИИ ФОРМАТИРОВАНИЯ ==========
 
-def check_for_updates(context, user_id):
+def check_for_updates(context):
     """Проверяет, есть ли обновления для пользователя"""
     user_version = context.user_data.get('data_version', 0)
     current_version = _data_cache.get('version', 0)
@@ -385,7 +422,8 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
         if date_str:
             try:
                 return datetime.strptime(date_str, "%d.%m.%Y")
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Ошибка парсинга даты: {e}")
                 pass
         return datetime.max
 
@@ -417,7 +455,7 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
         due_date = item.get('Срок', '')
         task_data = item.get('Задание', 'Нет описания')
 
-        status_emoji = ""
+        status_emoji = "⏳"
         if due_date:
             try:
                 due = datetime.strptime(due_date, "%d.%m.%Y")
@@ -430,7 +468,8 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
                     status_emoji = "⚠️ ЗАВТРА!"
                 elif days_left <= 3:
                     status_emoji = f"⏰ {days_left} дн."
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Ошибка вычисления статуса: {e}")
                 pass
 
         if isinstance(task_data, dict):
@@ -496,6 +535,10 @@ async def check_links_job(context: ContextTypes.DEFAULT_TYPE):
         if pending:
             logger.info(f"📬 Найдено {len(pending)} новых ссылок")
             users = get_subscribed_users()
+
+            if not users:
+                logger.warning("⚠️ Нет подписанных пользователей")
+                return
 
             for link in pending:
                 message = (
@@ -579,6 +622,7 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 Привет, {user.first_name}!\n\n"
         "Я бот для отслеживания домашних заданий и ссылок.\n"
+        f"📍 Московское время: {format_moscow_time()}\n"
         "Выбери действие:",
         reply_markup=reply_markup
     )
@@ -587,7 +631,6 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, _: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help"""
     user = update.effective_user
-    user_id = user.id
     username = user.username or user.first_name
 
     logger.info(f"👤 Пользователь @{username} вызвал команду /help")
@@ -708,6 +751,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• Отображать гиперссылки в заданиях\n"
                 "• Присылать ссылки\n"
                 "• Фильтровать по срокам\n\n"
+
                 "<b>Команды:</b>\n"
                 "/hw - показать задания\n"
                 "/links - показать ссылки\n"
@@ -808,18 +852,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_user_state(user_id, 'HELP_TASKS')
 
             help_text = (
-                "📚 <b>Помощь по боту</b>\n\n"
-                "<b>Что я умею:</b>\n"
-                "• Показывать домашние задания из таблицы\n"
-                "• Отображать гиперссылки в заданиях\n"
-                "• Присылать ссылки\n"
-                "• Фильтровать по срокам\n\n"
-                "<b>Команды:</b>\n"
-                "/hw - показать задания\n"
-                "/links - показать ссылки\n"
-                "/start - главное меню\n\n"
-                "<b>Навигация:</b>\n"
-                "🏠 Главное меню - вернуться на главную"
+                "📚 <b>Работа с заданиями</b>\n\n"
+                "<b>Кнопки:</b>\n"
+                "◀️ Назад / Вперед ▶️ - листать страницы\n"
+                "🔄 Обновить - загрузить свежие данные\n"
+                "📅 Сегодня - показать задания на сегодня\n"
+                "🏠 Главное меню - вернуться в начало\n\n"
+                "<b>Статусы:</b>\n"
+                "🔥 СЕГОДНЯ! - сдать сегодня\n"
+                "⚠️ ЗАВТРА! - сдать завтра\n"
+                "⏰ N дн. - осталось N дней\n"
+                "❗️ ПРОСРОЧЕНО - задание просрочено"
             )
 
             keyboard = [[InlineKeyboardButton("◀️ Назад к заданиям", callback_data="back_to_tasks")]]
@@ -968,7 +1011,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         due = datetime.strptime(date_str, "%d.%m.%Y").date()
                         if due == today:
                             filtered.append(item)
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"Ошибка парсинга даты: {e}")
                         pass
 
             if filtered:
@@ -1005,7 +1049,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ Произошла ошибка. {MESSAGES['start']}",
                 disable_web_page_preview=True
             )
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Ошибка при отправке сообщения об ошибке: {e}")
             pass
 
 
@@ -1034,8 +1079,16 @@ def main():
     updater_thread.start()
     logger.info("✅ Фоновая проверка обновлений заданий запущена")
 
-    # Создаём приложение
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    # Создаём приложение с настройками для многозадачности
+    app = Application.builder() \
+        .token(TELEGRAM_TOKEN) \
+        .concurrent_updates(True) \
+        .build()
+
+    # Увеличиваем количество worker-ов для обработки
+    if hasattr(app, 'dispatcher'):
+        app.dispatcher.workers = 8
+        logger.info("✅ Количество worker-ов увеличено до 8")
 
     # Добавляем фоновые задачи
     job_queue = app.job_queue
