@@ -1,0 +1,99 @@
+name: Parse Webinar Links
+
+on:
+  schedule:
+    - cron: '11 14 * * 1-5'  # 17:11 МСК
+    - cron: '30 15 * * 1-5'  # 18:30 МСК
+  workflow_dispatch:
+    inputs:
+      subject:
+        description: 'Название предмета'
+        required: false
+        default: ''
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: parser/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./parser
+        run: npm ci
+
+      - name: Get today's schedule
+        id: schedule
+        run: |
+          TODAY=$(date +%d.%m.%Y)
+          echo "today=$TODAY" >> $GITHUB_OUTPUT
+
+          SUBJECT=$(node -e "
+            const schedule = require('./parser/schedule.json');
+            const today = '$TODAY';
+            const webinar = schedule.datesAndNames.find(item => item.date === today);
+            console.log(webinar ? webinar.name : '');
+          ")
+
+          echo "subject=$SUBJECT" >> $GITHUB_OUTPUT
+          echo "✅ Сегодня: $TODAY"
+
+          if [[ -n "$SUBJECT" ]]; then
+            echo "📚 Предмет: $SUBJECT"
+          else
+            echo "📭 На сегодня вебинаров нет в расписании"
+          fi
+
+      - name: Check if we should run
+        id: check
+        run: |
+          if [[ -z "${{ steps.schedule.outputs.subject }}" && -z "${{ github.event.inputs.subject }}" ]]; then
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            echo "⏭️ Пропускаем: сегодня нет вебинаров по расписанию"
+          else
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run parser
+        if: steps.check.outputs.should_run == 'true'
+        working-directory: ./parser
+        env:
+          LOGIN: ${{ secrets.LOGIN }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          PAR_NAME: ${{ github.event.inputs.subject || steps.schedule.outputs.subject }}
+        run: node main.js "$PAR_NAME"
+
+      - name: Check and save link
+        if: success() && steps.check.outputs.should_run == 'true'
+        run: |
+          if [ -f parser/link.txt ]; then
+            LINK=$(cat parser/link.txt)
+            SUBJECT="${{ github.event.inputs.subject || steps.schedule.outputs.subject }}"
+
+            mkdir -p shared-data
+
+            sqlite3 shared-data/bot_data.db <<EOF
+            INSERT INTO links (par_name, link)
+            VALUES ('$SUBJECT', '$LINK');
+            EOF
+
+            echo "✅ Ссылка сохранена в БД: $SUBJECT"
+            echo "🔗 $LINK"
+          else
+            echo "⚠️ Файл link.txt не найден"
+          fi
+
+      - name: Upload database as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-data
+          path: shared-data/bot_data.db
+          retention-days: 7

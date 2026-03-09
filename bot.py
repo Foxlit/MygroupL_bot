@@ -4,6 +4,7 @@ import re
 import time
 import logging
 import threading
+import asyncio
 from datetime import datetime, timedelta
 from functools import wraps
 from dotenv import load_dotenv
@@ -11,9 +12,12 @@ from dotenv import load_dotenv
 import gspread
 from google.oauth2.service_account import Credentials
 from google.auth.exceptions import GoogleAuthError
-from google.api_core.exceptions import GoogleAPIError
+from googleapiclient.errors import HttpError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
+# Импорт базы данных
+from database import db, add_user, get_all_users, get_pending_webinars, mark_webinar_notified
 
 # ========== НАСТРОЙКА ЛОГИРОВАНИЯ ==========
 logging.basicConfig(
@@ -87,14 +91,16 @@ USER_STATES = {
     'HELP_MAIN': '❓ ПОМОЩЬ (главная)',
     'HELP_TASKS': '❓ ПОМОЩЬ (задания)',
     'FILTER_TODAY': '📅 ФИЛЬТР: СЕГОДНЯ',
+    'FILTER_OVERDUE': '⚠️ ФИЛЬТР: ПРОСРОЧКА',
+    'WEBINARS': '📹 Пары'
 }
 
 
 def set_user_state(user_id, state, page=None):
     """Устанавливает состояние пользователя с красивым логированием"""
     if page is not None and state == 'TASKS_LIST':
-        user_state[user_id] = f'TASKS_LIST_PAGE_{page+1}'
-        logger.info(f"📍 📄 СТРАНИЦА {page+1}")
+        user_state[user_id] = f'TASKS_LIST_PAGE_{page}'
+        logger.info(f"📍 📄 СТРАНИЦА {page}")
     else:
         user_state[user_id] = state
         logger.info(f"📍 {USER_STATES.get(state, 'НЕИЗВЕСТНОЕ СОСТОЯНИЕ')}")
@@ -149,7 +155,6 @@ def parse_hyperlink_formula(formula):
     if not formula or not isinstance(formula, str):
         return None, None
 
-    # Паттерны для разных вариантов
     patterns = [
         r'=ГИПЕРССЫЛКА\("([^"]+)";\s*"([^"]*)"\)',
         r'=HYPERLINK\("([^"]+)";\s*"([^"]*)"\)',
@@ -164,10 +169,9 @@ def parse_hyperlink_formula(formula):
             text = match.group(2)
             if text and not text.startswith('"'):
                 text = text.strip()
-            logger.debug(f"✅ Паттерн {i + 1} сработал: URL={url[:30]}..., ТЕКСТ={text[:30]}...")
+            logger.debug(f"✅ Паттерн {i + 1} сработал: URL={url[:30]}...")
             return url, text
 
-    # Упрощенный парсинг на случай, если паттерны не сработали
     try:
         url_match = re.search(r'"([^"]+)"', formula)
         if url_match:
@@ -176,7 +180,8 @@ def parse_hyperlink_formula(formula):
             text = text_match.group(1) if text_match else "Ссылка"
             logger.debug(f"✅ Упрощенный парсинг: URL={url[:30]}...")
             return url, text
-    except:
+    except Exception as e:
+        logger.error(f'⚠️ Не удалось распарсить формулу {e}')
         pass
 
     logger.warning(f"⚠️ Не удалось распарсить формулу: {formula[:100]}...")
@@ -189,7 +194,6 @@ def get_homework_fast(force_refresh=False):
     """МАКСИМАЛЬНО ОПТИМИЗИРОВАННАЯ функция загрузки"""
     global _data_cache
 
-    # Проверяем кэш
     if not force_refresh and _data_cache['data'] and (time.time() - _data_cache['timestamp']) < CACHE_TTL:
         logger.info("📦 Использую кэшированные данные")
         return _data_cache['data']
@@ -203,11 +207,9 @@ def get_homework_fast(force_refresh=False):
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         client = gspread.authorize(creds)
 
-        # Открываем таблицу
         spreadsheet = client.open_by_key(SHEET_KEY)
         sheet = spreadsheet.worksheet(SHEET_WORKSHEET)
 
-        # Получаем значения с формулами
         all_values = sheet.get_all_values(value_render_option='FORMULA')
 
         if len(all_values) < 2:
@@ -217,8 +219,6 @@ def get_homework_fast(force_refresh=False):
             return []
 
         headers = all_values[0]
-
-        # Обрабатываем данные в памяти
         records = []
 
         for row_idx, row in enumerate(all_values[1:], start=2):
@@ -229,26 +229,23 @@ def get_homework_fast(force_refresh=False):
                 else:
                     value = row[i]
 
-                # Обработка разных типов колонок
                 if header == "Задание" and value and isinstance(value, str):
                     if 'HYPERLINK' in value or 'ГИПЕРССЫЛКА' in value:
-                        logger.debug(f"🔍 Строка {row_idx}: найдена формула: {value[:100]}...")
+                        logger.debug(f"🔍 Строка {row_idx}: найдена формула")
                         url, text = parse_hyperlink_formula(value)
                         if url:
-                            logger.info(f"✅ Строка {row_idx}: успешно распознана ссылка: {url[:50]}...")
+                            logger.info(f"✅ Строка {row_idx}: распознана ссылка")
                             record[header] = {
                                 'text': text or "Ссылка",
                                 'url': url,
                                 'is_hyperlink': True
                             }
                         else:
-                            logger.warning(f"⚠️ Строка {row_idx}: не удалось распознать формулу: {value[:100]}...")
                             record[header] = {'text': value, 'is_hyperlink': False}
                     else:
                         record[header] = {'text': value, 'is_hyperlink': False}
 
                 elif header == "Срок" and value:
-                    # Конвертируем Excel-дату в нормальный формат
                     try:
                         if isinstance(value, (int, float)) or (
                                 isinstance(value, str) and value.replace('.', '').replace('-', '').isdigit()):
@@ -257,25 +254,22 @@ def get_homework_fast(force_refresh=False):
                                 base_date = datetime(1899, 12, 30)
                                 converted_date = base_date + timedelta(days=excel_date)
                                 date_str = converted_date.strftime("%d.%m.%Y")
-                                logger.debug(f"📅 Строка {row_idx}: преобразовано {value} -> {date_str}")
                                 record[header] = date_str
                             else:
                                 record[header] = str(value)
                         else:
                             record[header] = str(value)
                     except Exception as e:
-                        logger.warning(f"⚠️ Ошибка преобразования даты '{value}': {e}")
+                        logger.error(f'Не получилось 1{e}')
                         record[header] = str(value)
                 else:
                     record[header] = value
 
             records.append(record)
 
-        # Проверяем, изменились ли данные
         old_data = _data_cache['data']
         new_version = _data_cache['version'] + 1 if records != old_data else _data_cache['version']
 
-        # Сохраняем в кэш
         _data_cache['data'] = records
         _data_cache['timestamp'] = time.time()
         _data_cache['version'] = new_version
@@ -288,16 +282,14 @@ def get_homework_fast(force_refresh=False):
 
         return records
 
-    except (GoogleAuthError, GoogleAPIError, gspread.exceptions.APIError) as e:
+    except (GoogleAuthError, HttpError, gspread.exceptions.APIError) as e:
         logger.error(f"❌ Ошибка Google API: {e}")
         if _data_cache['data']:
-            logger.info("📦 Возвращаю кэшированные данные из-за ошибки API")
             return _data_cache['data']
         raise
     except Exception as e:
         logger.error(f"❌ Неизвестная ошибка: {e}", exc_info=True)
         if _data_cache['data']:
-            logger.info("📦 Возвращаю кэшированные данные из-за ошибки")
             return _data_cache['data']
         raise
 
@@ -331,33 +323,25 @@ def background_cache_updater():
 
 # ========== ФУНКЦИИ ФОРМАТИРОВАНИЯ ==========
 
-def check_for_updates(context, user_id):
+def check_for_updates(context):
     """Проверяет, есть ли обновления для пользователя"""
     user_version = context.user_data.get('data_version', 0)
     current_version = _data_cache.get('version', 0)
-
     return current_version > user_version
 
 
 def format_homework_page(records, page=0, show_update_notice=False, current_filter=None):
-    """Форматирует одну страницу с заданиями
-
-    Args:
-        records: список заданий
-        page: текущая страница
-        show_update_notice: показывать ли уведомление об обновлении
-        current_filter: текущий активный фильтр (None, 'today')
-    """
+    """Форматирует одну страницу с заданиями"""
     if not records:
-        return "📭 В таблице нет данных, можете отдохнуть или связаться с администратором", []
+        return "📭 На сегодня заданий нет. Можно отдыхать!", []
 
-    # Сортируем по сроку
     def get_date(item):
-        date_str = item.get('Срок')
+        date_str = item.get('Срок', '')
         if date_str:
             try:
                 return datetime.strptime(date_str, "%d.%m.%Y")
-            except:
+            except Exception as E:
+                logger.error(f'Что-то со сроками {E}')
                 pass
         return datetime.max
 
@@ -370,12 +354,10 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
     end_idx = min(start_idx + ITEMS_PER_PAGE, len(sorted_records))
     current_page_records = sorted_records[start_idx:end_idx]
 
-    # Добавляем уведомление об обновлении, если нужно
     message = ""
     if show_update_notice:
         message += f"{MESSAGES['new_data']}\n\n"
 
-    # Добавляем индикатор активного фильтра
     filter_indicator = ""
     if current_filter == 'today':
         filter_indicator = " [Фильтр: сегодня]"
@@ -383,9 +365,9 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
     message += f"📚 <b>Домашнее задание{filter_indicator}</b> (страница {page + 1}/{total_pages})\n\n"
 
     for idx, item in enumerate(current_page_records, start=start_idx + 1):
-        subject = item.get('Предмет')
-        due_date = item.get('Срок')
-        task_data = item.get('Задание')
+        subject = item.get('Предмет', 'Без предмета')
+        due_date = item.get('Срок', '')
+        task_data = item.get('Задание', 'Нет описания')
 
         status_emoji = ""
         if due_date:
@@ -400,7 +382,8 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
                     status_emoji = "⚠️ ЗАВТРА!"
                 elif days_left <= 3:
                     status_emoji = f"⏰ {days_left} дн."
-            except:
+            except Exception as e:
+                logger.error(f'Не удалось вывести информацию фильтров {e}')
                 pass
 
         if isinstance(task_data, dict):
@@ -422,7 +405,6 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
         message += f"   📌 {task_display}\n"
         message += f"   📅 Срок: {due_date} {status_emoji}\n\n"
 
-    # Кнопки навигации
     keyboard = []
 
     nav_buttons = []
@@ -434,27 +416,20 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
     if nav_buttons:
         keyboard.append(nav_buttons)
 
-    # Кнопки действий - УМНЫЕ КНОПКИ
     filter_buttons = []
-
-    # Кнопка обновления (всегда доступна)
     refresh_emoji = "🔄" + ("❗" if show_update_notice else "")
     filter_buttons.append(InlineKeyboardButton(f"{refresh_emoji} Обновить", callback_data="refresh_data"))
 
-    # Кнопка "Сегодня" - показываем только если не в этом фильтре
     if current_filter != 'today':
         filter_buttons.append(InlineKeyboardButton("📅 Сегодня", callback_data="filter_today"))
 
-    # Кнопка "Назад к списку" - если мы в фильтре
     if current_filter:
         filter_buttons.append(InlineKeyboardButton("◀️ К списку", callback_data="back_to_tasks"))
 
     if filter_buttons:
-        # Разбиваем на ряды по 2 кнопки
         for i in range(0, len(filter_buttons), 2):
             keyboard.append(filter_buttons[i:i + 2])
 
-    # Кнопка помощи и главное меню
     keyboard.append([
         InlineKeyboardButton("❓ Помощь", callback_data="help_tasks"),
         InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")
@@ -463,36 +438,111 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
     return message, keyboard
 
 
+# ========== ФУНКЦИЯ ПРОВЕРКИ ПАР ==========
+async def check_webinars_job(context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая задача для проверки новых ссылок на пары"""
+    logger.info("🔍 Проверяю новые ссылки на пару...")
+
+    try:
+        pending = get_pending_webinars()
+
+        if pending:
+            logger.info(f"📬 Найдено {len(pending)} новых ссылок")
+            users = get_all_users()
+
+            if not users:
+                logger.warning("⚠️ Нет подписанных пользователей")
+                return
+
+            for webinar in pending:
+                message = (
+                    f"🔔 <b>Новая ссылка на пару!</b>\n\n"
+                    f"📚 Предмет: {webinar['par_name']}\n"
+                    f"🔗 <a href='{webinar['link']}'>Подключиться к паре</a>\n"
+                )
+
+                sent_count = 0
+                for user_id in users:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=user_id,
+                            text=message,
+                            parse_mode="HTML",
+                            disable_web_page_preview=False
+                        )
+                        sent_count += 1
+                        await asyncio.sleep(0.05)
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка отправки пользователю {user_id}: {e}")
+
+                mark_webinar_notified(webinar['id'])
+                logger.info(f"✅ Отправлено {sent_count} пользователям, ссылка ID {webinar['id']}")
+        else:
+            logger.info("📭 Новых ссылок нет")
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка в check_webinars_job: {e}", exc_info=True)
+
+
+# ========== КОМАНДА ДЛЯ ПРОСМОТРА ПАР ==========
+async def webinars_command(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    """Показывает сегодняшние пары"""
+    user = update.effective_user
+    username = user.username or user.first_name
+
+    logger.info(f"👤 Пользователь @{username} запросил пары")
+
+    try:
+        today_webinars = db.get_today_webinars()
+
+        if today_webinars:
+            message = "📹 <b>Сегодняшние пары:</b>\n\n"
+            for w in today_webinars:
+                status = "✅ Отправлено" if w['notified'] else "⏳ Ожидает отправки"
+                message += f"• <b>{w['par_name']}</b>\n"
+                message += f"  🔗 {w['link']}\n"
+                message += f"  {status}\n\n"
+        else:
+            message = "📭 На сегодня пар нет"
+
+        await update.message.reply_text(message, parse_mode="HTML")
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка в webinars_command: {e}")
+        await update.message.reply_text("❌ Не удалось получить список пар")
+
+
 # ========== ОБРАБОТЧИКИ КОМАНД ==========
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start - главное меню"""
     user = update.effective_user
     user_id = user.id
     username = user.username or user.first_name
 
+    add_user(user.id, user.username, user.first_name)
+    logger.info(f"👤 Пользователь {user.id} сохранен в БД")
     logger.info(f"👤 Пользователь @{username} (ID: {user_id}) вызвал команду /start")
     set_user_state(user_id, 'MAIN_MENU')
 
-    # Главное меню
     keyboard = [
         [InlineKeyboardButton("📚 Показать задания", callback_data="show_hw")],
+        [InlineKeyboardButton("📹 Пары сегодня", callback_data="webinars_today")],
         [InlineKeyboardButton("❓ Помощь", callback_data="help_main")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
         f"👋 Привет, {user.first_name}!\n\n"
-        "Я бот для отслеживания домашних заданий.\n"
+        "Я бот для отслеживания домашних заданий и пар.\n"
         "Выбери действие:",
         reply_markup=reply_markup
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_command(update: Update, _: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help - показывает подробную помощь"""
     user = update.effective_user
-    user_id = user.id
     username = user.username or user.first_name
 
     logger.info(f"👤 Пользователь @{username} вызвал команду /help")
@@ -501,26 +551,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📚 <b>Помощь по боту</b>\n\n"
         "<b>Основные команды:</b>\n"
         "• /hw - показать домашнее задание\n"
+        "• /webinars - показать ссылки на пару\n"
         "• /help - показать это сообщение\n"
-        "• /start - перезапуск бота\n\n"
+        "• /start - главное меню\n\n"
 
-        "<b>Как пользоваться:</b>\n"
-        "1. Напишите /hw или нажмите кнопку '📚 Показать задания'\n"
-        "2. Листайте страницы кнопками ◀️ Назад / Вперед ▶️\n"
-        "3. Используйте фильтры для быстрого поиска:\n"
-        "   • 📅 Сегодня - задания на сегодня\n"
-        "   • 🔄 Обновить - загрузить свежие данные\n\n"
-
-        "<b>Что означают статусы:</b>\n"
+        "<b>Статусы заданий:</b>\n"
         "• 🔥 СЕГОДНЯ! - сдать сегодня\n"
         "• ⚠️ ЗАВТРА! - сдать завтра\n"
         "• ⏰ N дн. - осталось N дней\n"
-        "• ❗️ ПРОСРОЧЕНО - задание просрочено (для отладки)\n\n"
+        "• ❗️ ПРОСРОЧЕНО - задание просрочено\n\n"
 
-        "<b>Дополнительно:</b>\n"
-        "• Ссылки в заданиях кликабельны (синий текст)\n"
-        "• Данные проверяются автоматически каждую минуту, но обновляете их отображение Вы вручную\n"
-        "• Если что-то не работает - напишите /start для перезапуска"
+        "<b>Пары:</b>\n"
+        "• Ссылки появляются автоматически\n"
+        "• Бот присылает уведомления о новых\n"
+        "• Можно посмотреть все сегодняшние"
     )
 
     keyboard = [[InlineKeyboardButton("🏠 В главное меню", callback_data="main_menu")]]
@@ -543,7 +587,6 @@ async def homework_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"👤 Пользователь @{username} (ID: {user_id}) вызвал команду /hw")
 
-    # Проверка на спам
     current_time = time.time()
     if user_id in user_last_request:
         time_diff = current_time - user_last_request[user_id]
@@ -612,13 +655,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "<b>Что я умею:</b>\n"
                 "• Показывать домашние задания из таблицы\n"
                 "• Отображать гиперссылки в заданиях\n"
-                "• Фильтровать задания по срокам\n\n"
+                "• Присылать ссылки на пары\n"
+                "• Фильтровать по срокам\n\n"
                 "<b>Команды:</b>\n"
-                "/hw - сразу показать задания\n"
-                "/help - подробная помощь\n"
-                "/start - перезапуск бота\n\n"
+                "/hw - показать задания\n"
+                "/webinars - показать ссылки на пары\n"
+                "/start - главное меню\n\n"
                 "<b>Навигация:</b>\n"
-                "🏠 Главное меню - вернуться на главную"
+                "🏠 Главное меню - вернуться сюда"
             )
 
             keyboard = [[InlineKeyboardButton("🏠 В главное меню", callback_data="main_menu")]]
@@ -637,6 +681,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             keyboard = [
                 [InlineKeyboardButton("📚 Показать задания", callback_data="show_hw")],
+                [InlineKeyboardButton("📹 Пары сегодня", callback_data="webinars_today")],
                 [InlineKeyboardButton("❓ Помощь", callback_data="help_main")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -644,6 +689,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 "👋 Главное меню:",
                 reply_markup=reply_markup
+            )
+
+        elif data == "webinars_today":
+            set_user_state(user_id, 'WEBINARS')
+
+            today_webinars = db.get_today_webinars()
+
+            if today_webinars:
+                message = "📹 <b>Пары на сегодня:</b>\n\n"
+                for w in today_webinars:
+                    status = "✅" if w['notified'] else "⏳"
+                    message += f"• {w['par_name']}\n"
+                    message += f"  🔗 {w['link']}\n"
+                    message += f"  {status}\n\n"
+            else:
+                message = "📭 На сегодня пар нет"
+
+            keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="main_menu")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                message,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
             )
 
         # ===== КНОПКИ СПИСКА ЗАДАНИЙ =====
@@ -697,8 +767,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🔥 СЕГОДНЯ! - сдать сегодня\n"
                 "⚠️ ЗАВТРА! - сдать завтра\n"
                 "⏰ N дн. - осталось N дней\n"
-                "❗️ ПРОСРОЧЕНО - задание просрочено (для отладки)\n\n"
-                f"{MESSAGES['help']}"
+                "❗️ ПРОСРОЧЕНО - задание просрочено"
             )
 
             keyboard = [[InlineKeyboardButton("◀️ Назад к заданиям", callback_data="back_to_tasks")]]
@@ -787,7 +856,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif data.startswith("page_"):
             page = int(data.split("_")[1])
-            logger.info(f"📄 Пользователь {username} перешел на страницу {page+1}")
+            logger.info(f"📄 Пользователь {username} перешел на страницу {page}")
 
             homework_data = context.user_data.get('homework_data', [])
 
@@ -823,7 +892,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "filter_today":
             logger.info(f"📅 Пользователь {username} фильтрует: сегодня")
 
-            # Проверяем, не в фильтре ли мы уже
             if user_state.get(user_id) == 'FILTER_TODAY':
                 logger.info("⚠️ Уже в фильтре сегодня, пропускаем")
                 return
@@ -842,13 +910,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             today = datetime.now().date()
             filtered = []
             for item in homework_data:
-                date_str = item.get('Срок')
+                date_str = item.get('Срок', '')
                 if date_str:
                     try:
                         due = datetime.strptime(date_str, "%d.%m.%Y").date()
                         if due == today:
                             filtered.append(item)
-                    except:
+                    except Exception as e:
+                        logger.error(f'Снова что-то со сроками не так {e}')
                         pass
 
             if filtered:
@@ -885,7 +954,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ Произошла ошибка. {MESSAGES['start']}",
                 disable_web_page_preview=True
             )
-        except:
+        except Exception as e:
+            logger.error(f'Неизвестная ошибка с кнопками {e}')
             pass
 
 
@@ -907,17 +977,20 @@ def main():
     logger.info(f"  • Интервал проверки: {CHECK_INTERVAL} сек")
     logger.info(f"  • Защита от спама: {REQUEST_COOLDOWN} сек")
 
-    # Запускаем фоновую проверку обновлений
     updater_thread = threading.Thread(target=background_cache_updater, daemon=True)
     updater_thread.start()
-    logger.info("✅ Фоновая проверка обновлений запущена")
+    logger.info("✅ Фоновая проверка обновлений заданий запущена")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Добавляем обработчики команд
+    job_queue = app.job_queue
+    job_queue.run_repeating(check_webinars_job, interval=300, first=10)
+    logger.info("✅ Фоновая проверка пар запущена (интервал 5 минут)")
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("hw", homework_command))
+    app.add_handler(CommandHandler("webinars", webinars_command))
     app.add_handler(CallbackQueryHandler(button_handler))
 
     logger.info("✅ Обработчики команд зарегистрированы")

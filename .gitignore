@@ -1,2 +1,27 @@
-.env
-bot.log
+*.env
+*.log
+
+# База данных
+*.db
+*.db.backup
+shared-data/bot_data.db
+/venv/
+
+# Результаты парсинга
+parser/node_modules/
+parser/link.txt
+parser/*.png
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

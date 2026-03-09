@@ -1,0 +1,18 @@
+{
+  "name": "mmu-pars",
+  "version": "1.0.0",
+  "description": "",
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node main.js",
+    "fs": "node filess.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "puppeteer": "^24.34.0",
+    "sqlite3": "^5.1.7"
+  }
+}
