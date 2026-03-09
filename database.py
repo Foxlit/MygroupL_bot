@@ -10,7 +10,6 @@ from typing import List, Dict, Optional
 
 DB_PATH = Path(__file__).parent / "shared-data" / "bot_data.db"
 
-
 class Database:
     """Класс для работы с базой данных"""
 
@@ -29,51 +28,6 @@ class Database:
         conn.row_factory = sqlite3.Row
         return conn
 
-    # ===== РАБОТА С ВЕБИНАРАМИ =====
-
-    def save_webinar_link(self, par_name: str, link: str) -> int:
-        """Сохраняет ссылку на вебинар"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO links (par_name, link) VALUES (?, ?)",
-                (par_name, link)
-            )
-            conn.commit()
-            return cursor.lastrowid
-
-    def get_pending_webinars(self) -> List[Dict]:
-        """Получает неотправленные ссылки на вебинары"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM links 
-                WHERE notified = 0 
-                ORDER BY parsed_at DESC
-            """)
-            return [dict(row) for row in cursor.fetchall()]
-
-    def mark_webinar_notified(self, link_id: int):
-        """Отмечает ссылку как отправленную"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE links SET notified = 1 WHERE id = ?",
-                (link_id,)
-            )
-            conn.commit()
-
-    def get_today_webinars(self) -> List[Dict]:
-        """Получает сегодняшние вебинары"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM links 
-                WHERE date(parsed_at) = date('now')
-                ORDER BY parsed_at DESC
-            """)
-            return [dict(row) for row in cursor.fetchall()]
-
     # ===== РАБОТА С ПОЛЬЗОВАТЕЛЯМИ =====
 
     def add_user(self, user_id: int, username: str = None, first_name: str = None):
@@ -90,14 +44,11 @@ class Database:
             """, (user_id, username, first_name))
             conn.commit()
 
-    def get_all_users(self, only_subscribed=True) -> List[int]:
-        """Получает список всех пользователей"""
+    def get_subscribed_users(self) -> List[int]:
+        """Получает список подписанных пользователей"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            if only_subscribed:
-                cursor.execute("SELECT user_id FROM users WHERE subscribed = 1")
-            else:
-                cursor.execute("SELECT user_id FROM users")
+            cursor.execute("SELECT user_id FROM users WHERE subscribed = 1")
             return [row[0] for row in cursor.fetchall()]
 
     def unsubscribe_user(self, user_id: int):
@@ -109,6 +60,59 @@ class Database:
                 (user_id,)
             )
             conn.commit()
+
+    # ===== РАБОТА СО ССЫЛКАМИ =====
+
+    def save_link(self, par_name: str, link: str) -> int:
+        """Сохраняет ссылку"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO links (par_name, link) VALUES (?, ?)",
+                (par_name, link)
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_pending_links(self) -> List[Dict]:
+        """Получает неотправленные ссылки"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM links 
+                WHERE notified = 0 
+                ORDER BY parsed_at DESC
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def mark_link_notified(self, link_id: int):
+        """Отмечает ссылку как отправленную"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE links SET notified = 1 WHERE id = ?",
+                (link_id,)
+            )
+            conn.commit()
+
+    def get_today_links(self) -> List[Dict]:
+        """Получает сегодняшние ссылки"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM links 
+                WHERE date(parsed_at) = date('now')
+                ORDER BY parsed_at DESC
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_link_by_id(self, link_id: int) -> Optional[Dict]:
+        """Получает ссылку по ID"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM links WHERE id = ?", (link_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
 
     # ===== ЛОГИРОВАНИЕ =====
 
@@ -132,35 +136,34 @@ class Database:
             )
             return [dict(row) for row in cursor.fetchall()]
 
-
 # Создаем глобальный экземпляр для удобства
 db = Database()
 
+# ===== ФУНКЦИИ ДЛЯ БЫСТРОГО ИМПОРТА =====
+def get_pending_links():
+    """Обёртка для быстрого доступа"""
+    return db.get_pending_links()
 
-# Функции для обратной совместимости
-def save_webinar_link(par_name, link):
-    return db.save_webinar_link(par_name, link)
+def mark_link_notified(link_id):
+    """Обёртка для быстрого доступа"""
+    db.mark_link_notified(link_id)
 
+def get_today_links():
+    """Обёртка для быстрого доступа"""
+    return db.get_today_links()
 
-def get_pending_webinars():
-    return db.get_pending_webinars()
-
-
-def mark_webinar_notified(link_id):
-    db.mark_webinar_notified(link_id)
-
+def save_link(par_name, link):
+    """Обёртка для быстрого доступа"""
+    return db.save_link(par_name, link)
 
 def add_user(user_id, username=None, first_name=None):
+    """Обёртка для быстрого доступа"""
     db.add_user(user_id, username, first_name)
 
-
-def get_all_users():
-    return db.get_all_users()
-
-
-def unsubscribe_user(user_id):
-    db.unsubscribe_user(user_id)
-
+def get_subscribed_users():
+    """Обёртка для быстрого доступа"""
+    return db.get_subscribed_users()
 
 def add_log(level, message):
+    """Обёртка для быстрого доступа"""
     db.add_log(level, message)

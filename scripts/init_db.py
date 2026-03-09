@@ -6,7 +6,9 @@
 
 import sqlite3
 import sys
+import shutil
 from pathlib import Path
+from datetime import datetime
 
 # Добавляем родительскую папку в путь
 sys.path.append(str(Path(__file__).parent.parent))
@@ -21,19 +23,16 @@ def init_database():
     # Создаём папку если её нет
     db_path.parent.mkdir(exist_ok=True)
 
-    # Удаляем старую БД если нужно пересоздать
+    # Создаём бэкап если БД существует
     if db_path.exists():
-        # Создаём бэкап с временной меткой
-        from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup = db_path.parent / f"bot_data_backup_{timestamp}.db"
-
         print(f"📦 Создаю резервную копию: {backup}")
-        db_path.rename(backup)
+        shutil.copy2(db_path, backup)
 
-        # Удаляем старые бэкапы (оставляем только 5 последних)
+        # Удаляем старые бэкапы (оставляем 5 последних)
         backups = sorted(db_path.parent.glob("bot_data_backup_*.db"))
-        for old_backup in backups[:-5]:  # удаляем все кроме 5 последних
+        for old_backup in backups[:-5]:
             old_backup.unlink()
             print(f"🗑️ Удалён старый бэкап: {old_backup}")
 
@@ -43,7 +42,19 @@ def init_database():
 
     print("🚀 Создаю таблицы...")
 
-    # ===== ТАБЛИЦА ДЛЯ ВЕБИНАРОВ =====
+    # ===== ТАБЛИЦА ПОЛЬЗОВАТЕЛЕЙ =====
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            subscribed BOOLEAN DEFAULT 1,
+            last_active TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # ===== ТАБЛИЦА ССЫЛОК =====
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS links (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,13 +67,13 @@ def init_database():
         )
     """)
 
-    # Индекс для быстрого поиска неотправленных
+    # Индекс для быстрого поиска
     cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_webinar_notified 
+        CREATE INDEX IF NOT EXISTS idx_links_notified 
         ON links(notified, parsed_at)
     """)
 
-    # ===== ТАБЛИЦА ДЛЯ ДОМАШНИХ ЗАДАНИЙ (на будущее) =====
+    # ===== ТАБЛИЦА ДЛЯ ДОМАШНИХ ЗАДАНИЙ =====
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS homework (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,18 +81,6 @@ def init_database():
             task TEXT,
             due_date TEXT,
             source TEXT DEFAULT 'google_sheets',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # ===== ТАБЛИЦА ДЛЯ ПОЛЬЗОВАТЕЛЕЙ =====
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            subscribed BOOLEAN DEFAULT 1,
-            last_active TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -96,10 +95,9 @@ def init_database():
         )
     """)
 
-    # Сохраняем изменения
     conn.commit()
 
-    # Проверяем, что создалось
+    # Проверяем результат
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
     tables = cursor.fetchall()
 
@@ -108,16 +106,10 @@ def init_database():
     print("\n📊 Созданные таблицы:")
     for table in tables:
         print(f"  • {table[0]}")
-
-    # Показываем структуру каждой таблицы
-    print("\n🔍 Структура таблиц:")
-    for table in tables:
-        table_name = table[0]
-        cursor.execute(f"PRAGMA table_info({table_name})")
+        cursor.execute(f"PRAGMA table_info({table[0]})")
         columns = cursor.fetchall()
-        print(f"\n  📋 {table_name}:")
         for col in columns:
-            print(f"    - {col[1]} ({col[2]})")
+            print(f"    - {col[1]}: {col[2]}")
 
     conn.close()
 
@@ -162,51 +154,6 @@ class Database:
         conn.row_factory = sqlite3.Row
         return conn
 
-    # ===== РАБОТА С ВЕБИНАРАМИ =====
-
-    def save_webinar_link(self, par_name: str, link: str) -> int:
-        """Сохраняет ссылку на вебинар"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO links (par_name, link) VALUES (?, ?)",
-                (par_name, link)
-            )
-            conn.commit()
-            return cursor.lastrowid
-
-    def get_pending_webinars(self) -> List[Dict]:
-        """Получает неотправленные ссылки на вебинары"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM links 
-                WHERE notified = 0 
-                ORDER BY parsed_at DESC
-            """)
-            return [dict(row) for row in cursor.fetchall()]
-
-    def mark_webinar_notified(self, link_id: int):
-        """Отмечает ссылку как отправленную"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE links SET notified = 1 WHERE id = ?",
-                (link_id,)
-            )
-            conn.commit()
-
-    def get_today_webinars(self) -> List[Dict]:
-        """Получает сегодняшние вебинары"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM links 
-                WHERE date(parsed_at) = date('now')
-                ORDER BY parsed_at DESC
-            """)
-            return [dict(row) for row in cursor.fetchall()]
-
     # ===== РАБОТА С ПОЛЬЗОВАТЕЛЯМИ =====
 
     def add_user(self, user_id: int, username: str = None, first_name: str = None):
@@ -223,14 +170,11 @@ class Database:
             """, (user_id, username, first_name))
             conn.commit()
 
-    def get_all_users(self, only_subscribed=True) -> List[int]:
-        """Получает список всех пользователей"""
+    def get_subscribed_users(self) -> List[int]:
+        """Получает список подписанных пользователей"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            if only_subscribed:
-                cursor.execute("SELECT user_id FROM users WHERE subscribed = 1")
-            else:
-                cursor.execute("SELECT user_id FROM users")
+            cursor.execute("SELECT user_id FROM users WHERE subscribed = 1")
             return [row[0] for row in cursor.fetchall()]
 
     def unsubscribe_user(self, user_id: int):
@@ -242,6 +186,59 @@ class Database:
                 (user_id,)
             )
             conn.commit()
+
+    # ===== РАБОТА СО ССЫЛКАМИ =====
+
+    def save_link(self, par_name: str, link: str) -> int:
+        """Сохраняет ссылку"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO links (par_name, link) VALUES (?, ?)",
+                (par_name, link)
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_pending_links(self) -> List[Dict]:
+        """Получает неотправленные ссылки"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM links 
+                WHERE notified = 0 
+                ORDER BY parsed_at DESC
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def mark_link_notified(self, link_id: int):
+        """Отмечает ссылку как отправленную"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE links SET notified = 1 WHERE id = ?",
+                (link_id,)
+            )
+            conn.commit()
+
+    def get_today_links(self) -> List[Dict]:
+        """Получает сегодняшние ссылки"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM links 
+                WHERE date(parsed_at) = date('now')
+                ORDER BY parsed_at DESC
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_link_by_id(self, link_id: int) -> Optional[Dict]:
+        """Получает ссылку по ID"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM links WHERE id = ?", (link_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
 
     # ===== ЛОГИРОВАНИЕ =====
 
@@ -265,37 +262,36 @@ class Database:
             )
             return [dict(row) for row in cursor.fetchall()]
 
-
 # Создаем глобальный экземпляр для удобства
 db = Database()
 
+# ===== ФУНКЦИИ ДЛЯ БЫСТРОГО ИМПОРТА =====
+def get_pending_links():
+    """Обёртка для быстрого доступа"""
+    return db.get_pending_links()
 
-# Функции для обратной совместимости
-def save_webinar_link(par_name, link):
-    return db.save_webinar_link(par_name, link)
+def mark_link_notified(link_id):
+    """Обёртка для быстрого доступа"""
+    db.mark_link_notified(link_id)
 
+def get_today_links():
+    """Обёртка для быстрого доступа"""
+    return db.get_today_links()
 
-def get_pending_webinars():
-    return db.get_pending_webinars()
-
-
-def mark_webinar_notified(link_id):
-    db.mark_webinar_notified(link_id)
-
+def save_link(par_name, link):
+    """Обёртка для быстрого доступа"""
+    return db.save_link(par_name, link)
 
 def add_user(user_id, username=None, first_name=None):
+    """Обёртка для быстрого доступа"""
     db.add_user(user_id, username, first_name)
 
-
-def get_all_users():
-    return db.get_all_users()
-
-
-def unsubscribe_user(user_id):
-    db.unsubscribe_user(user_id)
-
+def get_subscribed_users():
+    """Обёртка для быстрого доступа"""
+    return db.get_subscribed_users()
 
 def add_log(level, message):
+    """Обёртка для быстрого доступа"""
     db.add_log(level, message)
 '''
 

@@ -8,6 +8,7 @@ import asyncio
 from datetime import datetime, timedelta
 from functools import wraps
 from dotenv import load_dotenv
+import pytz  # Добавляем pytz для работы с часовыми поясами
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -17,7 +18,11 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # Импорт базы данных
-from database import db, add_user, get_all_users, get_pending_webinars, mark_webinar_notified
+from database import db, get_pending_links, mark_link_notified, get_today_links, get_subscribed_users
+
+# ========== НАСТРОЙКА ЧАСОВОГО ПОЯСА ==========
+MOSCOW_TZ = pytz.timezone('Europe/Moscow')
+UTC_TZ = pytz.UTC
 
 # ========== НАСТРОЙКА ЛОГИРОВАНИЯ ==========
 logging.basicConfig(
@@ -33,7 +38,6 @@ logger = logging.getLogger('homework_bot')
 logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('telegram').setLevel(logging.WARNING)
 logging.getLogger('googleapiclient').setLevel(logging.WARNING)
-logging.getLogger('apscheduler').setLevel(logging.WARNING)
 
 # ========== ЗАГРУЗКА ПЕРЕМЕННЫХ ==========
 load_dotenv()
@@ -65,7 +69,8 @@ CHECK_INTERVAL = 60  # Проверка обновлений каждую мин
 _data_cache = {
     'data': None,
     'timestamp': 0,
-    'version': 0
+    'version': 0,
+    'last_successful_data': None
 }
 
 user_last_request = {}
@@ -75,13 +80,15 @@ user_state = {}
 MESSAGES = {
     'start': "Напишите /start для перезапуска",
     'hw': "Напишите /hw для загрузки заданий",
+    'links': "Напишите /links для просмотра ссылок",
     'help': "Напишите /help для помощи",
     'error': "❌ Ошибка. Напишите /start для перезапуска",
     'no_data': "📭 Данные не загружены. Напишите /hw",
     'cooldown': "⏳ Подождите {} секунд перед следующим запросом",
     'new_data': "🔔 Обнаружены новые данные! Рекомендуется обновить список",
     'update_available': "🔄 Доступно обновление",
-    'api_error': "⚠️ Временно недоступно. Используются сохранённые данные"
+    'api_error': "⚠️ Временно недоступно. Используются сохранённые данные",
+    'data_from': "📅 Данные от {}"
 }
 
 # ========== СОСТОЯНИЯ ПОЛЬЗОВАТЕЛЕЙ ==========
@@ -92,7 +99,7 @@ USER_STATES = {
     'HELP_TASKS': '❓ ПОМОЩЬ (задания)',
     'FILTER_TODAY': '📅 ФИЛЬТР: СЕГОДНЯ',
     'FILTER_OVERDUE': '⚠️ ФИЛЬТР: ПРОСРОЧКА',
-    'WEBINARS': '📹 Пары'
+    'LINKS': '🔗 ССЫЛКИ'
 }
 
 
@@ -104,6 +111,18 @@ def set_user_state(user_id, state, page=None):
     else:
         user_state[user_id] = state
         logger.info(f"📍 {USER_STATES.get(state, 'НЕИЗВЕСТНОЕ СОСТОЯНИЕ')}")
+
+
+def get_moscow_time():
+    """Возвращает текущее время в Москве"""
+    return datetime.now(MOSCOW_TZ)
+
+
+def format_moscow_time(dt=None):
+    """Форматирует время в московский формат"""
+    if dt is None:
+        dt = get_moscow_time()
+    return dt.strftime("%d.%m.%Y %H:%M")
 
 
 # ========== ДЕКОРАТОРЫ ==========
@@ -151,7 +170,7 @@ def safe_api_call(default_return=None):
 # ========== ФУНКЦИИ ДЛЯ РАБОТЫ С GOOGLE SHEETS ==========
 
 def parse_hyperlink_formula(formula):
-    """Извлекает URL и текст из формулы ГИПЕРССЫЛКА (поддержка EN и RU)"""
+    """Извлекает URL и текст из формулы ГИПЕРССЫЛКА"""
     if not formula or not isinstance(formula, str):
         return None, None
 
@@ -169,7 +188,6 @@ def parse_hyperlink_formula(formula):
             text = match.group(2)
             if text and not text.startswith('"'):
                 text = text.strip()
-            logger.debug(f"✅ Паттерн {i + 1} сработал: URL={url[:30]}...")
             return url, text
 
     try:
@@ -178,20 +196,17 @@ def parse_hyperlink_formula(formula):
             url = url_match.group(1)
             text_match = re.search(r'[;,]\s*"([^"]+)"', formula)
             text = text_match.group(1) if text_match else "Ссылка"
-            logger.debug(f"✅ Упрощенный парсинг: URL={url[:30]}...")
             return url, text
-    except Exception as e:
-        logger.error(f'⚠️ Не удалось распарсить формулу {e}')
+    except Exception:
         pass
 
-    logger.warning(f"⚠️ Не удалось распарсить формулу: {formula[:100]}...")
     return None, None
 
 
 @safe_api_call(default_return=[])
 @timer_decorator
 def get_homework_fast(force_refresh=False):
-    """МАКСИМАЛЬНО ОПТИМИЗИРОВАННАЯ функция загрузки"""
+    """Загрузка данных из Google Sheets с сохранением последней успешной версии"""
     global _data_cache
 
     if not force_refresh and _data_cache['data'] and (time.time() - _data_cache['timestamp']) < CACHE_TTL:
@@ -213,10 +228,9 @@ def get_homework_fast(force_refresh=False):
         all_values = sheet.get_all_values(value_render_option='FORMULA')
 
         if len(all_values) < 2:
-            _data_cache['data'] = []
+            logger.warning("⚠️ В таблице только заголовки")
             _data_cache['timestamp'] = time.time()
-            _data_cache['version'] += 1
-            return []
+            return _data_cache.get('last_successful_data', [])
 
         headers = all_values[0]
         records = []
@@ -231,10 +245,8 @@ def get_homework_fast(force_refresh=False):
 
                 if header == "Задание" and value and isinstance(value, str):
                     if 'HYPERLINK' in value or 'ГИПЕРССЫЛКА' in value:
-                        logger.debug(f"🔍 Строка {row_idx}: найдена формула")
                         url, text = parse_hyperlink_formula(value)
                         if url:
-                            logger.info(f"✅ Строка {row_idx}: распознана ссылка")
                             record[header] = {
                                 'text': text or "Ссылка",
                                 'url': url,
@@ -259,38 +271,32 @@ def get_homework_fast(force_refresh=False):
                                 record[header] = str(value)
                         else:
                             record[header] = str(value)
-                    except Exception as e:
-                        logger.error(f'Не получилось 1{e}')
+                    except Exception:
                         record[header] = str(value)
                 else:
                     record[header] = value
 
             records.append(record)
 
-        old_data = _data_cache['data']
-        new_version = _data_cache['version'] + 1 if records != old_data else _data_cache['version']
-
+        _data_cache['last_successful_data'] = records
         _data_cache['data'] = records
         _data_cache['timestamp'] = time.time()
-        _data_cache['version'] = new_version
+        _data_cache['version'] += 1
 
         hyperlink_count = sum(1 for r in records
                               if isinstance(r.get('Задание'), dict)
                               and r['Задание'].get('is_hyperlink'))
 
         logger.info(f"✅ Загружено: {len(records)} записей, {hyperlink_count} гиперссылок")
+        logger.info(f"📅 Время данных: {format_moscow_time()}")
 
         return records
 
-    except (GoogleAuthError, HttpError, gspread.exceptions.APIError) as e:
-        logger.error(f"❌ Ошибка Google API: {e}")
-        if _data_cache['data']:
-            return _data_cache['data']
-        raise
     except Exception as e:
-        logger.error(f"❌ Неизвестная ошибка: {e}", exc_info=True)
-        if _data_cache['data']:
-            return _data_cache['data']
+        logger.error(f"❌ Ошибка загрузки: {e}")
+        if _data_cache.get('last_successful_data'):
+            logger.info("📦 Возвращаю последние успешные данные")
+            return _data_cache['last_successful_data']
         raise
 
 
@@ -304,16 +310,8 @@ def background_cache_updater():
             time.sleep(CHECK_INTERVAL)
             logger.info("🔄 Проверка обновлений...")
 
-            old_version = _data_cache['version']
-
             try:
-                new_data = get_homework_fast(force_refresh=True)
-                if new_data:
-                    new_version = _data_cache['version']
-                    if new_version > old_version:
-                        logger.info(f"🆕 Обнаружены изменения! Версия {old_version} -> {new_version}")
-                    else:
-                        logger.info("✅ Изменений не обнаружено")
+                get_homework_fast(force_refresh=True)
             except Exception as e:
                 logger.error(f"❌ Ошибка при проверке обновлений: {e}")
 
@@ -321,9 +319,56 @@ def background_cache_updater():
             logger.error(f"❌ Критическая ошибка в фоновом обновлении: {e}")
 
 
+async def daily_update_job(context: ContextTypes.DEFAULT_TYPE):
+    """Ежедневное обновление данных в 00:00 МСК с уведомлением пользователей"""
+    moscow_time = get_moscow_time()
+    logger.info(f"📅 Запуск ежедневного обновления в {format_moscow_time(moscow_time)}")
+
+    try:
+        old_version = _data_cache.get('version', 0)
+        new_data = get_homework_fast(force_refresh=True)
+        new_version = _data_cache.get('version', 0)
+
+        if new_data:
+            if new_version > old_version:
+                logger.info(f"✅ Данные обновлены: версия {old_version} -> {new_version}")
+
+                # Получаем всех пользователей
+                users = get_subscribed_users()
+
+                if users:
+                    update_message = (
+                        "🔄 <b>Ежедневное обновление</b>\n\n"
+                        f"📅 Данные обновлены на {format_moscow_time()}\n"
+                        "Напишите /hw для просмотра"
+                    )
+
+                    sent_count = 0
+                    for user_id in users:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=user_id,
+                                text=update_message,
+                                parse_mode="HTML"
+                            )
+                            sent_count += 1
+                            await asyncio.sleep(0.05)
+                        except Exception as e:
+                            logger.error(f"❌ Ошибка отправки уведомления {user_id}: {e}")
+
+                    logger.info(f"📨 Уведомления отправлены {sent_count} пользователям")
+            else:
+                logger.info("📅 Данные не изменились")
+        else:
+            logger.warning("⚠️ Не удалось получить новые данные")
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка ежедневного обновления: {e}")
+
+
 # ========== ФУНКЦИИ ФОРМАТИРОВАНИЯ ==========
 
-def check_for_updates(context):
+def check_for_updates(context, user_id):
     """Проверяет, есть ли обновления для пользователя"""
     user_version = context.user_data.get('data_version', 0)
     current_version = _data_cache.get('version', 0)
@@ -340,8 +385,7 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
         if date_str:
             try:
                 return datetime.strptime(date_str, "%d.%m.%Y")
-            except Exception as E:
-                logger.error(f'Что-то со сроками {E}')
+            except Exception:
                 pass
         return datetime.max
 
@@ -357,6 +401,10 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
     message = ""
     if show_update_notice:
         message += f"{MESSAGES['new_data']}\n\n"
+
+    if _data_cache['timestamp'] > 0:
+        update_time = datetime.fromtimestamp(_data_cache['timestamp']).strftime("%d.%m.%Y %H:%M")
+        message += f"{MESSAGES['data_from'].format(update_time)}\n"
 
     filter_indicator = ""
     if current_filter == 'today':
@@ -382,8 +430,7 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
                     status_emoji = "⚠️ ЗАВТРА!"
                 elif days_left <= 3:
                     status_emoji = f"⏰ {days_left} дн."
-            except Exception as e:
-                logger.error(f'Не удалось вывести информацию фильтров {e}')
+            except Exception:
                 pass
 
         if isinstance(task_data, dict):
@@ -438,27 +485,23 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
     return message, keyboard
 
 
-# ========== ФУНКЦИЯ ПРОВЕРКИ ПАР ==========
-async def check_webinars_job(context: ContextTypes.DEFAULT_TYPE):
-    """Фоновая задача для проверки новых ссылок на пары"""
-    logger.info("🔍 Проверяю новые ссылки на пару...")
+# ========== ФУНКЦИЯ ПРОВЕРКИ ССЫЛОК ==========
+async def check_links_job(context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая задача для проверки новых ссылок"""
+    logger.info("🔍 Проверяю новые ссылки...")
 
     try:
-        pending = get_pending_webinars()
+        pending = get_pending_links()
 
         if pending:
             logger.info(f"📬 Найдено {len(pending)} новых ссылок")
-            users = get_all_users()
+            users = get_subscribed_users()
 
-            if not users:
-                logger.warning("⚠️ Нет подписанных пользователей")
-                return
-
-            for webinar in pending:
+            for link in pending:
                 message = (
-                    f"🔔 <b>Новая ссылка на пару!</b>\n\n"
-                    f"📚 Предмет: {webinar['par_name']}\n"
-                    f"🔗 <a href='{webinar['link']}'>Подключиться к паре</a>\n"
+                    f"🔔 <b>Новая ссылка!</b>\n\n"
+                    f"📚 {link['par_name']}\n"
+                    f"🔗 <a href='{link['link']}'>Перейти</a>\n"
                 )
 
                 sent_count = 0
@@ -475,41 +518,41 @@ async def check_webinars_job(context: ContextTypes.DEFAULT_TYPE):
                     except Exception as e:
                         logger.error(f"❌ Ошибка отправки пользователю {user_id}: {e}")
 
-                mark_webinar_notified(webinar['id'])
-                logger.info(f"✅ Отправлено {sent_count} пользователям, ссылка ID {webinar['id']}")
+                mark_link_notified(link['id'])
+                logger.info(f"✅ Отправлено {sent_count} пользователям, ссылка ID {link['id']}")
         else:
             logger.info("📭 Новых ссылок нет")
 
     except Exception as e:
-        logger.error(f"❌ Ошибка в check_webinars_job: {e}", exc_info=True)
+        logger.error(f"❌ Ошибка в check_links_job: {e}", exc_info=True)
 
 
-# ========== КОМАНДА ДЛЯ ПРОСМОТРА ПАР ==========
-async def webinars_command(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    """Показывает сегодняшние пары"""
+# ========== КОМАНДА ДЛЯ ПРОСМОТРА ССЫЛОК ==========
+async def links_command(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    """Показывает сегодняшние ссылки"""
     user = update.effective_user
     username = user.username or user.first_name
 
-    logger.info(f"👤 Пользователь @{username} запросил пары")
+    logger.info(f"👤 Пользователь @{username} запросил ссылки (/links)")
 
     try:
-        today_webinars = db.get_today_webinars()
+        today_links = get_today_links()
 
-        if today_webinars:
-            message = "📹 <b>Сегодняшние пары:</b>\n\n"
-            for w in today_webinars:
-                status = "✅ Отправлено" if w['notified'] else "⏳ Ожидает отправки"
+        if today_links:
+            message = "🔗 <b>Сегодняшние ссылки:</b>\n\n"
+            for w in today_links:
+                status = "✅ Отправлено" if w['notified'] else "⏳ Ожидает"
                 message += f"• <b>{w['par_name']}</b>\n"
                 message += f"  🔗 {w['link']}\n"
                 message += f"  {status}\n\n"
         else:
-            message = "📭 На сегодня пар нет"
+            message = "📭 На сегодня ссылок нет"
 
         await update.message.reply_text(message, parse_mode="HTML")
 
     except Exception as e:
-        logger.error(f"❌ Ошибка в webinars_command: {e}")
-        await update.message.reply_text("❌ Не удалось получить список пар")
+        logger.error(f"❌ Ошибка в links_command: {e}")
+        await update.message.reply_text("❌ Не удалось получить список ссылок")
 
 
 # ========== ОБРАБОТЧИКИ КОМАНД ==========
@@ -520,29 +563,31 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     username = user.username or user.first_name
 
-    add_user(user.id, user.username, user.first_name)
+    # Добавляем пользователя в БД
+    db.add_user(user.id, user.username, user.first_name)
     logger.info(f"👤 Пользователь {user.id} сохранен в БД")
     logger.info(f"👤 Пользователь @{username} (ID: {user_id}) вызвал команду /start")
     set_user_state(user_id, 'MAIN_MENU')
 
     keyboard = [
         [InlineKeyboardButton("📚 Показать задания", callback_data="show_hw")],
-        [InlineKeyboardButton("📹 Пары сегодня", callback_data="webinars_today")],
+        [InlineKeyboardButton("🔗 Ссылки сегодня", callback_data="links_today")],
         [InlineKeyboardButton("❓ Помощь", callback_data="help_main")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
         f"👋 Привет, {user.first_name}!\n\n"
-        "Я бот для отслеживания домашних заданий и пар.\n"
+        "Я бот для отслеживания домашних заданий и ссылок.\n"
         "Выбери действие:",
         reply_markup=reply_markup
     )
 
 
 async def help_command(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /help - показывает подробную помощь"""
+    """Обработчик команды /help"""
     user = update.effective_user
+    user_id = user.id
     username = user.username or user.first_name
 
     logger.info(f"👤 Пользователь @{username} вызвал команду /help")
@@ -551,9 +596,14 @@ async def help_command(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "📚 <b>Помощь по боту</b>\n\n"
         "<b>Основные команды:</b>\n"
         "• /hw - показать домашнее задание\n"
-        "• /webinars - показать ссылки на пару\n"
+        "• /links - показать ссылки\n"
         "• /help - показать это сообщение\n"
         "• /start - главное меню\n\n"
+
+        "<b>Как пользоваться:</b>\n"
+        "1. Напишите /hw для просмотра заданий\n"
+        "2. Напишите /links для просмотра ссылок\n"
+        "3. Используйте кнопки для навигации\n\n"
 
         "<b>Статусы заданий:</b>\n"
         "• 🔥 СЕГОДНЯ! - сдать сегодня\n"
@@ -561,10 +611,11 @@ async def help_command(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "• ⏰ N дн. - осталось N дней\n"
         "• ❗️ ПРОСРОЧЕНО - задание просрочено\n\n"
 
-        "<b>Пары:</b>\n"
-        "• Ссылки появляются автоматически\n"
-        "• Бот присылает уведомления о новых\n"
-        "• Можно посмотреть все сегодняшние"
+        "<b>Обновление данных:</b>\n"
+        "• Задания обновляются ежедневно в 00:00 МСК\n"
+        "• Дата последнего обновления показывается сверху\n"
+        "• При ошибке показываются предыдущие данные\n\n"
+        f"🕐 Текущее время МСК: {format_moscow_time()}"
     )
 
     keyboard = [[InlineKeyboardButton("🏠 В главное меню", callback_data="main_menu")]]
@@ -580,7 +631,7 @@ async def help_command(update: Update, _: ContextTypes.DEFAULT_TYPE):
 
 @async_timer_decorator
 async def homework_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /hw - быстрая загрузка заданий"""
+    """Обработчик команды /hw"""
     user = update.effective_user
     user_id = user.id
     username = user.username or user.first_name
@@ -655,14 +706,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "<b>Что я умею:</b>\n"
                 "• Показывать домашние задания из таблицы\n"
                 "• Отображать гиперссылки в заданиях\n"
-                "• Присылать ссылки на пары\n"
+                "• Присылать ссылки\n"
                 "• Фильтровать по срокам\n\n"
                 "<b>Команды:</b>\n"
                 "/hw - показать задания\n"
-                "/webinars - показать ссылки на пары\n"
+                "/links - показать ссылки\n"
                 "/start - главное меню\n\n"
                 "<b>Навигация:</b>\n"
-                "🏠 Главное меню - вернуться сюда"
+                "🏠 Главное меню - вернуться на главную"
             )
 
             keyboard = [[InlineKeyboardButton("🏠 В главное меню", callback_data="main_menu")]]
@@ -681,7 +732,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             keyboard = [
                 [InlineKeyboardButton("📚 Показать задания", callback_data="show_hw")],
-                [InlineKeyboardButton("📹 Пары сегодня", callback_data="webinars_today")],
+                [InlineKeyboardButton("🔗 Ссылки сегодня", callback_data="links_today")],
                 [InlineKeyboardButton("❓ Помощь", callback_data="help_main")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -691,20 +742,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=reply_markup
             )
 
-        elif data == "webinars_today":
-            set_user_state(user_id, 'WEBINARS')
+        elif data == "links_today":
+            set_user_state(user_id, 'LINKS')
 
-            today_webinars = db.get_today_webinars()
+            today_links = get_today_links()
 
-            if today_webinars:
-                message = "📹 <b>Пары на сегодня:</b>\n\n"
-                for w in today_webinars:
-                    status = "✅" if w['notified'] else "⏳"
-                    message += f"• {w['par_name']}\n"
-                    message += f"  🔗 {w['link']}\n"
+            if today_links:
+                message = "🔗 <b>Ссылки на сегодня:</b>\n\n"
+                for link in today_links:
+                    status = "✅" if link['notified'] else "⏳"
+                    message += f"• {link['par_name']}\n"
+                    message += f"  🔗 {link['link']}\n"
                     message += f"  {status}\n\n"
             else:
-                message = "📭 На сегодня пар нет"
+                message = "📭 На сегодня ссылок нет"
 
             keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="main_menu")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -757,17 +808,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_user_state(user_id, 'HELP_TASKS')
 
             help_text = (
-                "📚 <b>Работа с заданиями</b>\n\n"
-                "<b>Кнопки:</b>\n"
-                "◀️ Назад / Вперед ▶️ - листать страницы\n"
-                "🔄 Обновить - загрузить свежие данные\n"
-                "📅 Сегодня - показать задания на сегодня\n"
-                "🏠 Главное меню - вернуться в начало\n\n"
-                "<b>Статусы:</b>\n"
-                "🔥 СЕГОДНЯ! - сдать сегодня\n"
-                "⚠️ ЗАВТРА! - сдать завтра\n"
-                "⏰ N дн. - осталось N дней\n"
-                "❗️ ПРОСРОЧЕНО - задание просрочено"
+                "📚 <b>Помощь по боту</b>\n\n"
+                "<b>Что я умею:</b>\n"
+                "• Показывать домашние задания из таблицы\n"
+                "• Отображать гиперссылки в заданиях\n"
+                "• Присылать ссылки\n"
+                "• Фильтровать по срокам\n\n"
+                "<b>Команды:</b>\n"
+                "/hw - показать задания\n"
+                "/links - показать ссылки\n"
+                "/start - главное меню\n\n"
+                "<b>Навигация:</b>\n"
+                "🏠 Главное меню - вернуться на главную"
             )
 
             keyboard = [[InlineKeyboardButton("◀️ Назад к заданиям", callback_data="back_to_tasks")]]
@@ -916,8 +968,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         due = datetime.strptime(date_str, "%d.%m.%Y").date()
                         if due == today:
                             filtered.append(item)
-                    except Exception as e:
-                        logger.error(f'Снова что-то со сроками не так {e}')
+                    except Exception:
                         pass
 
             if filtered:
@@ -954,8 +1005,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ Произошла ошибка. {MESSAGES['start']}",
                 disable_web_page_preview=True
             )
-        except Exception as e:
-            logger.error(f'Неизвестная ошибка с кнопками {e}')
+        except Exception:
             pass
 
 
@@ -976,21 +1026,58 @@ def main():
     logger.info(f"  • Время жизни кэша: {CACHE_TTL} сек")
     logger.info(f"  • Интервал проверки: {CHECK_INTERVAL} сек")
     logger.info(f"  • Защита от спама: {REQUEST_COOLDOWN} сек")
+    logger.info(f"  • Часовой пояс: Europe/Moscow (UTC+3)")
+    logger.info(f"  • Текущее время МСК: {format_moscow_time()}")
 
+    # Запускаем фоновую проверку обновлений заданий
     updater_thread = threading.Thread(target=background_cache_updater, daemon=True)
     updater_thread.start()
     logger.info("✅ Фоновая проверка обновлений заданий запущена")
 
+    # Создаём приложение
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # Добавляем фоновые задачи
     job_queue = app.job_queue
-    job_queue.run_repeating(check_webinars_job, interval=300, first=10)
-    logger.info("✅ Фоновая проверка пар запущена (интервал 5 минут)")
 
+    # Проверка ссылок каждые 5 минут
+    job_queue.run_repeating(check_links_job, interval=300, first=10)
+    logger.info("✅ Фоновая проверка ссылок запущена (интервал 5 минут)")
+
+    # Ежедневное обновление в 00:00 МСК
+    try:
+        # Получаем текущее время в Москве
+        now_moscow = get_moscow_time()
+
+        # Вычисляем следующую полночь по Москве
+        next_midnight = now_moscow.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+
+        # Конвертируем в UTC для планировщика (он работает в UTC)
+        next_midnight_utc = next_midnight.astimezone(UTC_TZ)
+        now_utc = datetime.now(UTC_TZ)
+
+        # Секунды до следующей полуночи по Москве
+        seconds_until_midnight = (next_midnight_utc - now_utc).total_seconds()
+
+        # Запускаем ежедневное обновление
+        job_queue.run_repeating(
+            daily_update_job,
+            interval=86400,  # 24 часа
+            first=seconds_until_midnight
+        )
+        logger.info(f"✅ Ежедневное обновление запланировано на {next_midnight.strftime('%H:%M')} МСК")
+
+    except Exception as e:
+        logger.error(f"⚠️ Ошибка при планировании обновления: {e}")
+        # Запасной вариант - обновление каждые 6 часов
+        job_queue.run_repeating(daily_update_job, interval=21600, first=3600)
+        logger.info("✅ Использую запасной вариант: обновление каждые 6 часов")
+
+    # Добавляем обработчики команд
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("hw", homework_command))
-    app.add_handler(CommandHandler("webinars", webinars_command))
+    app.add_handler(CommandHandler("links", links_command))
     app.add_handler(CallbackQueryHandler(button_handler))
 
     logger.info("✅ Обработчики команд зарегистрированы")
