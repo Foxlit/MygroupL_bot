@@ -1,4 +1,4 @@
-name: Parse Webinar Links
+name: Парсинг ссылок на пары
 
 on:
   schedule:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       subject:
-        description: 'Название предмета'
+        description: 'Название предмета (оставьте пустым для автоопределения)'
         required: false
         default: ''
 
@@ -30,65 +30,71 @@ jobs:
         working-directory: ./parser
         run: npm ci
 
-      - name: Get today's schedule
-        id: schedule
+      - name: Get today's subject
+        id: subject
         run: |
-          TODAY=$(date +%d.%m.%Y)
-          echo "today=$TODAY" >> $GITHUB_OUTPUT
-
-          SUBJECT=$(node -e "
-            const schedule = require('./parser/schedule.json');
-            const today = '$TODAY';
-            const webinar = schedule.datesAndNames.find(item => item.date === today);
-            console.log(webinar ? webinar.name : '');
-          ")
-
-          echo "subject=$SUBJECT" >> $GITHUB_OUTPUT
-          echo "✅ Сегодня: $TODAY"
-
-          if [[ -n "$SUBJECT" ]]; then
-            echo "📚 Предмет: $SUBJECT"
+          if [[ -n "${{ github.event.inputs.subject }}" ]]; then
+            echo "name=${{ github.event.inputs.subject }}" >> $GITHUB_OUTPUT
+            echo "manual=true" >> $GITHUB_OUTPUT
+            echo "✅ Ручной режим: ${{ github.event.inputs.subject }}"
           else
-            echo "📭 На сегодня вебинаров нет в расписании"
+            # Пытаемся найти сегодняшний предмет
+            SUBJECT=$(node -e "
+              const schedule = require('./parser/shedule.json');
+              const today = new Date();
+              const day = String(today.getDate()).padStart(2, '0');
+              const month = String(today.getMonth() + 1).padStart(2, '0');
+              const year = today.getFullYear();
+              const todayStr = \`\${day}.\${month}.\${year}\`;
+              const webinar = schedule.datesAndNames.find(item => item.date === todayStr);
+              console.log(webinar ? webinar.name : '');
+            ")
+            echo "name=$SUBJECT" >> $GITHUB_OUTPUT
+            echo "manual=false" >> $GITHUB_OUTPUT
+
+            if [[ -n "$SUBJECT" ]]; then
+              echo "✅ Автоопределение: $SUBJECT"
+            else
+              echo "⏭️ Сегодня вебинаров нет по расписанию"
+            fi
           fi
 
-      - name: Check if we should run
+      - name: Check if should run
         id: check
         run: |
-          if [[ -z "${{ steps.schedule.outputs.subject }}" && -z "${{ github.event.inputs.subject }}" ]]; then
-            echo "should_run=false" >> $GITHUB_OUTPUT
-            echo "⏭️ Пропускаем: сегодня нет вебинаров по расписанию"
+          if [[ -z "${{ steps.subject.outputs.name }}" ]]; then
+            echo "run=false" >> $GITHUB_OUTPUT
           else
-            echo "should_run=true" >> $GITHUB_OUTPUT
+            echo "run=true" >> $GITHUB_OUTPUT
           fi
 
       - name: Run parser
-        if: steps.check.outputs.should_run == 'true'
+        if: steps.check.outputs.run == 'true'
         working-directory: ./parser
         env:
           LOGIN: ${{ secrets.LOGIN }}
           PASSWORD: ${{ secrets.PASSWORD }}
-          PAR_NAME: ${{ github.event.inputs.subject || steps.schedule.outputs.subject }}
-        run: node main.js "$PAR_NAME"
+        run: node main.js "${{ steps.subject.outputs.name }}"
 
-      - name: Check and save link
-        if: success() && steps.check.outputs.should_run == 'true'
+      - name: Save link to database
+        if: success() && steps.check.outputs.run == 'true'
         run: |
           if [ -f parser/link.txt ]; then
             LINK=$(cat parser/link.txt)
-            SUBJECT="${{ github.event.inputs.subject || steps.schedule.outputs.subject }}"
+            SUBJECT="${{ steps.subject.outputs.name }}"
 
+            # Создаём папку если нет
             mkdir -p shared-data
 
+            # Сохраняем в SQLite
             sqlite3 shared-data/bot_data.db <<EOF
-            INSERT INTO links (par_name, link)
-            VALUES ('$SUBJECT', '$LINK');
+            INSERT INTO links (par_name, link) VALUES ('$SUBJECT', '$LINK');
             EOF
 
             echo "✅ Ссылка сохранена в БД: $SUBJECT"
             echo "🔗 $LINK"
           else
-            echo "⚠️ Файл link.txt не найден"
+            echo "⚠️ Файл link.txt не найден (возможно, ссылка ещё не появилась)"
           fi
 
       - name: Upload database as artifact

@@ -1,7 +1,7 @@
 {
   "name": "mmu-pars",
   "version": "1.0.0",
-  "description": "",
+  "description": "Парсер ссылок на пары",
   "license": "ISC",
   "author": "",
   "type": "commonjs",

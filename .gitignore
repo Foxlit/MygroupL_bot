@@ -25,3 +25,6 @@ __pycache__/
 *.swp
 *.swo
 *~
+
+# Исходная версия парсера (времянка, потом удалить)
+/MMU-par-finder-main (legacy)/
