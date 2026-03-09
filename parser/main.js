@@ -229,7 +229,7 @@ function findTodayParName() {
             return elem.name;
         }
     }
-    console.log(`📭 На ${todayString} вебинаров нет в расписании`);
+    console.log(`📭 На ${todayString} пар нет в расписании`);
     return null;
 }
 
