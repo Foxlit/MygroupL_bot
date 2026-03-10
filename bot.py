@@ -15,10 +15,15 @@ from google.oauth2.service_account import Credentials
 from google.auth.exceptions import GoogleAuthError, RefreshError
 from googleapiclient.errors import HttpError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 # Импорт базы данных
-from database import db, get_pending_links, mark_link_notified, get_today_links, get_subscribed_users
+from database import (
+    db, add_user, is_authorized, authorize_user, is_in_whitelist,
+    get_user_subscription, toggle_subscription, get_subscribed_users,
+    get_pending_links, mark_link_notified, get_today_links, add_log,
+    add_to_whitelist, get_whitelist, remove_from_whitelist
+)
 
 # ========== НАСТРОЙКА ЧАСОВОГО ПОЯСА ==========
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -47,6 +52,12 @@ GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS")
 SHEET_KEY = os.environ.get("SHEET_KEY")
 SHEET_WORKSHEET = os.environ.get("SHEET_WORKSHEET", "1 вариант")
 
+# 👑 ID администратора из переменных окружения
+try:
+    ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+except ValueError:
+    ADMIN_ID = 0
+
 if not TELEGRAM_TOKEN:
     logger.error("❌ TELEGRAM_BOT_TOKEN не найден в .env файле!")
     exit(1)
@@ -59,6 +70,11 @@ if not SHEET_KEY:
     logger.error("❌ SHEET_KEY не найден в .env файле!")
     exit(1)
 
+if ADMIN_ID == 0:
+    logger.error("❌ ADMIN_ID не найден или некорректен в .env файле!")
+    logger.error("💡 Добавьте в .env: ADMIN_ID=ваш_telegram_id")
+    exit(1)
+
 # ========== КОНСТАНТЫ ==========
 ITEMS_PER_PAGE = 5
 REQUEST_COOLDOWN = 5
@@ -68,11 +84,12 @@ CHECK_INTERVAL = 60  # Проверка обновлений каждую мин
 # Глобальный кэш с блокировкой для потокобезопасности
 _data_cache = {
     'data': None,
+    'previous_data': None,  # Предыдущая версия данных для сравнения
     'timestamp': 0,
     'version': 0,
     'last_successful_data': None
 }
-_cache_lock = threading.Lock()  # Для безопасного доступа из разных потоков
+_cache_lock = threading.Lock()
 
 user_last_request = {}
 user_state = {}
@@ -99,8 +116,9 @@ USER_STATES = {
     'HELP_MAIN': '❓ ПОМОЩЬ (главная)',
     'HELP_TASKS': '❓ ПОМОЩЬ (задания)',
     'FILTER_TODAY': '📅 ФИЛЬТР: СЕГОДНЯ',
-    'FILTER_OVERDUE': '⚠️ ФИЛЬТР: ПРОСРОЧКА',
-    'LINKS': '🔗 ССЫЛКИ'
+    'LINKS': '🔗 ССЫЛКИ',
+    'SETTINGS': '⚙️ НАСТРОЙКИ',
+    'ADMIN': '👑 АДМИН ПАНЕЛЬ'
 }
 
 
@@ -124,6 +142,78 @@ def format_moscow_time(dt=None):
     if dt is None:
         dt = get_moscow_time()
     return dt.strftime("%d.%m.%Y %H:%M")
+
+
+# ========== ДЕКОРАТОР АВТОРИЗАЦИИ ==========
+def authorized_only(func):
+    """Декоратор для проверки авторизации пользователя"""
+
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user = update.effective_user
+        if not user:
+            return
+
+        user_id = user.id
+        username = user.username or user.first_name
+
+        if not is_authorized(user_id):
+            if is_in_whitelist(user_id):
+                authorize_user(user_id)
+                add_log(user_id, "auth", "INFO", f"Автоматическая авторизация по белому списку")
+                logger.info(f"✅ Пользователь @{username} (ID: {user_id}) автоматически авторизован")
+            else:
+                logger.info(f"⛔ Пользователь @{username} (ID: {user_id}) попытался доступ без авторизации")
+
+                keyboard = [[InlineKeyboardButton("🔑 Запросить доступ", callback_data="request_access")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                if update.message:
+                    await update.message.reply_text(
+                        "🔒 <b>Доступ ограничен</b>\n\n"
+                        "Этот бот предназначен только для студентов группы.\n"
+                        "Если вы из нашей группы, нажмите кнопку ниже для запроса доступа.\n\n"
+                        "После проверки администратор добавит вас в белый список.",
+                        parse_mode="HTML",
+                        reply_markup=reply_markup
+                    )
+                elif update.callback_query:
+                    await update.callback_query.edit_message_text(
+                        "🔒 <b>Доступ ограничен</b>\n\n"
+                        "Этот бот предназначен только для студентов группы.\n"
+                        "Если вы из нашей группы, нажмите кнопку ниже для запроса доступа.\n\n"
+                        "После проверки администратор добавит вас в белый список.",
+                        parse_mode="HTML",
+                        reply_markup=reply_markup
+                    )
+
+                add_log(user_id, "auth", "WARNING", "Попытка доступа без авторизации")
+                return
+        return await func(update, context, *args, **kwargs)
+
+    return wrapper
+
+
+# ========== ДЕКОРАТОР АДМИНА ==========
+def admin_only(func):
+    """Декоратор для проверки прав администратора"""
+
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user = update.effective_user
+        if not user:
+            return
+
+        if user.id != ADMIN_ID:
+            if update.message:
+                await update.message.reply_text("❌ У вас нет прав для выполнения этой команды.")
+            elif update.callback_query:
+                await update.callback_query.edit_message_text("❌ У вас нет прав для выполнения этого действия.")
+            return
+
+        return await func(update, context, *args, **kwargs)
+
+    return wrapper
 
 
 # ========== ДЕКОРАТОРЫ ==========
@@ -223,13 +313,60 @@ def sync_windows_time():
     return False
 
 
+def is_record_changed(old_record, new_record):
+    """Проверяет, изменилась ли запись значимо для плашки НОВОЕ"""
+    if not old_record or not new_record:
+        return True
+
+    # Проверяем все поля, которые могут измениться
+    important_fields = ['Предмет', 'Задание', 'Срок']
+
+    for field in important_fields:
+        old_value = old_record.get(field)
+        new_value = new_record.get(field)
+
+        # Нормализуем значения для сравнения
+        old_str = str(old_value) if old_value is not None else ''
+        new_str = str(new_value) if new_value is not None else ''
+
+        # Если поле изменилось
+        if old_str != new_str:
+            # Для поля "Срок" специальная обработка
+            if field == 'Срок':
+                # Если было значение, а стало прочерком - это изменение
+                if old_str and old_str != '-' and (new_str == '-' or new_str == ''):
+                    logger.debug(f"📅 Дата удалена: {old_str} -> {new_str}")
+                    return True
+
+                # Если было прочерк, а появилась дата - это изменение
+                if (old_str == '-' or old_str == '') and new_str and new_str != '-':
+                    logger.debug(f"📅 Дата появилась: {old_str} -> {new_str}")
+                    return True
+
+                # Если обе даты - сравниваем их
+                if old_str and new_str and old_str != '-' and new_str != '-':
+                    try:
+                        old_date = datetime.strptime(old_str, "%d.%m.%Y")
+                        new_date = datetime.strptime(new_str, "%d.%m.%Y")
+                        if old_date != new_date:
+                            logger.debug(f"📅 Дата изменилась: {old_str} -> {new_str}")
+                            return True
+                    except:
+                        return True
+            else:
+                # Для других полей любое изменение - важно
+                logger.debug(f"✏️ Поле {field} изменилось: {old_str} -> {new_str}")
+                return True
+
+    return False
+
+
 @safe_api_call(default_return=[])
 @timer_decorator
 def get_homework_fast(force_refresh=False):
     """Загрузка данных из Google Sheets с сохранением последней успешной версии"""
     global _data_cache
 
-    # Проверяем кэш (с блокировкой для потокобезопасности)
     with _cache_lock:
         if not force_refresh and _data_cache['data'] and (time.time() - _data_cache['timestamp']) < CACHE_TTL:
             logger.info("📦 Использую кэшированные данные")
@@ -306,8 +443,11 @@ def get_homework_fast(force_refresh=False):
                               if isinstance(r.get('Задание'), dict)
                               and r['Задание'].get('is_hyperlink'))
 
-        # Обновляем кэш (с блокировкой)
         with _cache_lock:
+            # Сохраняем предыдущую версию перед обновлением
+            if _data_cache['data'] is not None:
+                _data_cache['previous_data'] = _data_cache['data'].copy()
+
             _data_cache['last_successful_data'] = records
             _data_cache['data'] = records
             _data_cache['timestamp'] = time.time()
@@ -356,74 +496,77 @@ def background_cache_updater():
             logger.error(f"❌ Критическая ошибка в фоновом обновлении: {e}")
 
 
-async def daily_update_job(context: ContextTypes.DEFAULT_TYPE):
-    """Ежедневное обновление данных в 00:00 МСК с уведомлением пользователей"""
-    moscow_time = get_moscow_time()
-    logger.info(f"📅 Запуск ежедневного обновления в {format_moscow_time(moscow_time)}")
-
-    try:
-        old_version = _data_cache.get('version', 0)
-        new_data = get_homework_fast(force_refresh=True)
-        new_version = _data_cache.get('version', 0)
-
-        if new_data:
-            if new_version > old_version:
-                logger.info(f"✅ Данные обновлены: версия {old_version} -> {new_version}")
-
-                # Получаем всех пользователей
-                users = get_subscribed_users()
-
-                if users:
-                    update_message = (
-                        "🔄 <b>Ежедневное обновление</b>\n\n"
-                        f"📅 Данные обновлены на {format_moscow_time()}\n"
-                        "Напишите /hw для просмотра"
-                    )
-
-                    sent_count = 0
-                    for user_id in users:
-                        try:
-                            await context.bot.send_message(
-                                chat_id=user_id,
-                                text=update_message,
-                                parse_mode="HTML"
-                            )
-                            sent_count += 1
-                            await asyncio.sleep(0.05)
-                        except Exception as e:
-                            logger.error(f"❌ Ошибка отправки уведомления {user_id}: {e}")
-
-                    logger.info(f"📨 Уведомления отправлены {sent_count} пользователям")
-            else:
-                logger.info("📅 Данные не изменились")
-        else:
-            logger.warning("⚠️ Не удалось получить новые данные")
-
-    except Exception as e:
-        logger.error(f"❌ Ошибка ежедневного обновления: {e}")
-
-
 # ========== ФУНКЦИИ ФОРМАТИРОВАНИЯ ==========
 
 def check_for_updates(context, user_id):
-    """Проверяет, есть ли обновления для пользователя"""
-    user_version = context.user_data.get('data_version', 0)
-    current_version = _data_cache.get('version', 0)
-    return current_version > user_version
+    """Проверяет, есть ли реальные изменения в данных для пользователя"""
+    current_data = _data_cache.get('data', [])
+    previous_data = _data_cache.get('previous_data', [])
+    seen_records = context.user_data.get('seen_records', {})
+
+    if not current_data:
+        return False
+
+    # Если пользователь только что загрузил данные (есть seen_records) - проверяем изменения
+    if seen_records:
+        # 1. Проверяем, есть ли новые записи
+        for item in current_data:
+            subject = item.get('Предмет')
+            due_date = item.get('Срок')
+
+            if due_date == '-' or due_date == '':
+                continue
+
+            record_id = f"{subject}_{due_date}"
+
+            if record_id not in seen_records:
+                logger.debug(f"🆕 Новая запись: {record_id}")
+                return True
+
+        # 2. Проверяем, изменились ли существующие записи
+        if previous_data:
+            for i, item in enumerate(current_data):
+                if i < len(previous_data):
+                    if is_record_changed(previous_data[i], item):
+                        subject = item.get('Предмет')
+                        due_date = item.get('Срок')
+                        if due_date != '-' and due_date != '':
+                            record_id = f"{subject}_{due_date}"
+                            if record_id not in seen_records:
+                                logger.debug(f"✏️ Изменилась запись: {record_id}")
+                                return True
+
+        # 3. Проверяем, не удалились ли записи
+        current_records = set()
+        for item in current_data:
+            subject = item.get('Предмет')
+            due_date = item.get('Срок')
+            if due_date != '-' and due_date != '':
+                record_id = f"{subject}_{due_date}"
+                current_records.add(record_id)
+
+        for record_id in seen_records.keys():
+            if record_id not in current_records:
+                logger.debug(f"🗑️ Удалена запись: {record_id}")
+                return True
+
+    # Если пользователь ещё не видел никаких записей - считаем что всё новое
+    # Но при первом просмотре не показываем уведомление
+    return False
 
 
-def format_homework_page(records, page=0, show_update_notice=False, current_filter=None):
-    """Форматирует одну страницу с заданиями"""
+def format_homework_page(records, page=0, show_update_notice=False, current_filter=None, context=None):
+    """Форматирует одну страницу с заданиями и плашкой НОВОЕ"""
     if not records:
         return "📭 На сегодня заданий нет. Можно отдыхать!", []
 
     def get_date(item):
-        date_str = item.get('Срок', '')
+        date_str = item.get('Срок')
         if date_str:
             try:
                 return datetime.strptime(date_str, "%d.%m.%Y")
-            except Exception as e:
-                logger.debug(f"Ошибка парсинга даты: {e}")
+            except Exception as E:
+                logger.debug(f"Ошибка парсинга даты: {E}")
                 pass
         return datetime.max
 
@@ -450,13 +593,38 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
 
     message += f"📚 <b>Домашнее задание{filter_indicator}</b> (страница {page + 1}/{total_pages})\n\n"
 
+    # Получаем просмотренные записи пользователя
+    seen_records = context.user_data.get('seen_records', {}) if context else {}
+    previous_data = _data_cache.get('previous_data', [])
+
     for idx, item in enumerate(current_page_records, start=start_idx + 1):
-        subject = item.get('Предмет', 'Без предмета')
-        due_date = item.get('Срок', '')
-        task_data = item.get('Задание', 'Нет описания')
+        subject = item.get('Предмет')
+        due_date = item.get('Срок')
+        task_data = item.get('Задание')
+
+        # Проверка на прочерк в дате
+        if due_date == '-' or due_date == '':
+            is_new = False
+        else:
+            # Создаём уникальный идентификатор записи
+            record_id = f"{subject}_{due_date}"
+
+            # Проверяем, видел ли пользователь эту запись
+            if record_id in seen_records:
+                is_new = False
+            else:
+                # Проверяем, изменилась ли запись по сравнению с предыдущей версией
+                if previous_data and idx - 1 < len(previous_data):
+                    old_record = previous_data[idx - 1]
+                    if old_record:
+                        is_new = is_record_changed(old_record, item)
+                    else:
+                        is_new = True
+                else:
+                    is_new = True
 
         status_emoji = ""
-        if due_date:
+        if due_date and due_date != '-':
             try:
                 due = datetime.strptime(due_date, "%d.%m.%Y")
                 days_left = (due.date() - datetime.now().date()).days
@@ -470,7 +638,6 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
                     status_emoji = f"⏰ {days_left} дн."
             except Exception as e:
                 logger.debug(f"Ошибка вычисления статуса: {e}")
-                pass
 
         if isinstance(task_data, dict):
             if task_data.get('is_hyperlink') and task_data.get('url'):
@@ -487,7 +654,9 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
             else:
                 task_display = task_display.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
-        message += f"{idx}. <b>{subject}</b>\n"
+        # Добавляем плашку НОВОЕ
+        new_badge = " 🆕 <b>НОВОЕ</b>" if is_new else ""
+        message += f"{idx}. <b>{subject}</b>{new_badge}\n"
         message += f"   📌 {task_display}\n"
         message += f"   📅 Срок: {due_date} {status_emoji}\n\n"
 
@@ -571,6 +740,7 @@ async def check_links_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ========== КОМАНДА ДЛЯ ПРОСМОТРА ССЫЛОК ==========
+@authorized_only
 async def links_command(update: Update, _: ContextTypes.DEFAULT_TYPE):
     """Показывает сегодняшние ссылки"""
     user = update.effective_user
@@ -598,38 +768,520 @@ async def links_command(update: Update, _: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не удалось получить список ссылок")
 
 
-# ========== ОБРАБОТЧИКИ КОМАНД ==========
+# ========== НАСТРОЙКИ ==========
+async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню настроек"""
+    query = update.callback_query
+    user = update.effective_user
+    user_id = user.id
 
-async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start - главное меню"""
+    await query.answer()
+
+    subscribed = get_user_subscription(user_id)
+    sub_status = "✅ Включена" if subscribed else "❌ Отключена"
+    sub_button = "🔕 Отключить рассылку" if subscribed else "🔔 Включить рассылку"
+
+    message = (
+        "⚙️ <b>Настройки</b>\n\n"
+        f"👤 Ваш ID: <code>{user_id}</code>\n"
+        f"📢 Рассылка ссылок: {sub_status}\n\n"
+        "<b>О рассылке:</b>\n"
+        "• Приходит автоматически при появлении новой ссылки\n"
+        "• Только для подписанных пользователей\n"
+        "• Можно отключить в любой момент"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton(sub_button, callback_data="toggle_subscription")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="main_menu")]
+    ]
+
+    if user_id == ADMIN_ID:
+        keyboard.insert(1, [InlineKeyboardButton("👑 Админ панель", callback_data="admin_panel")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(
+        message,
+        parse_mode="HTML",
+        reply_markup=reply_markup,
+        disable_web_page_preview=True
+    )
+
+
+async def toggle_subscription_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переключает подписку пользователя"""
+    query = update.callback_query
+    user = update.effective_user
+    user_id = user.id
+
+    await query.answer()
+
+    new_status = toggle_subscription(user_id)
+    status_text = "включена" if new_status else "отключена"
+
+    add_log(user_id, "settings", "INFO", f"Рассылка {status_text}")
+
+    await query.edit_message_text(
+        f"✅ Рассылка успешно {status_text}!\n\n"
+        "Настройки обновлены.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ Назад в настройки", callback_data="settings")
+        ]])
+    )
+
+
+# ========== АДМИН ПАНЕЛЬ ==========
+@admin_only
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админ панель"""
+    query = update.callback_query
+    await query.answer()
+
+    whitelist = get_whitelist()
+    authorized_users = db.get_authorized_users()
+
+    message = (
+        "👑 <b>Админ панель</b>\n\n"
+        f"📊 <b>Статистика:</b>\n"
+        f"• В белом списке: {len(whitelist)}\n"
+        f"• Авторизовано: {len(authorized_users)}\n\n"
+        "<b>Команды:</b>\n"
+        "• <code>/whitelist</code> - список доступа\n"
+        "• <code>/adduser &lt;id&gt; [комментарий]</code> - добавить пользователя\n"
+        "• <code>/removeuser &lt;id&gt;</code> - удалить пользователя\n"
+        "• <code>/broadcast &lt;текст&gt;</code> - массовая рассылка авторизованным пользователям\n\n"
+        "<b>Навигация:</b>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("📋 Белый список", callback_data="admin_whitelist")],
+        [InlineKeyboardButton("📢 Сделать рассылку", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="settings")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(
+        message,
+        parse_mode="HTML",
+        reply_markup=reply_markup,
+        disable_web_page_preview=True
+    )
+
+
+@admin_only
+async def admin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просмотр белого списка с красивым форматированием даты"""
+    query = update.callback_query
+    await query.answer()
+
+    whitelist = get_whitelist()
+
+    if not whitelist:
+        await query.edit_message_text(
+            "📭 Белый список пуст.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")
+            ]])
+        )
+        return
+
+    message = "📋 <b>Белый список:</b>\n\n"
+    for item in whitelist:
+        added_at = db.format_date(item['added_at'])
+
+        message += (
+            f"👤 ID: <code>{item['user_id']}</code>\n"
+            f"📝 {item['comment'] or 'без комментария'}\n"
+            f"📅 Добавлен: {added_at}\n\n"
+        )
+
+    if len(message) > 4000:
+        message = "📋 <b>Белый список (последние 10):</b>\n\n"
+        for item in whitelist[-10:]:
+            added_at = db.format_date(item['added_at'])
+            message += f"• <code>{item['user_id']}</code> - {item['comment'] or '?'}\n"
+            message += f"  🕐 {added_at}\n\n"
+
+    keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(
+        message,
+        parse_mode="HTML",
+        reply_markup=reply_markup,
+        disable_web_page_preview=True
+    )
+
+
+# ========== КОМАНДЫ АДМИНА ==========
+@admin_only
+async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для добавления пользователя в белый список"""
+    try:
+        args = context.args
+        if len(args) < 1:
+            await update.message.reply_text(
+                "❌ Использование: /adduser <user_id> [комментарий]\n"
+                "Пример: /adduser 123456789 Иванов Иван"
+            )
+            return
+
+        user_id = int(args[0])
+        comment = " ".join(args[1:]) if len(args) > 1 else ""
+
+        add_to_whitelist(user_id, update.effective_user.id, comment)
+
+        if not is_authorized(user_id):
+            authorize_user(user_id)
+
+        add_log(update.effective_user.id, "admin", "INFO", f"Добавил {user_id} в белый список")
+
+        await update.message.reply_text(
+            f"✅ Пользователь {user_id} добавлен в белый список!\n"
+            f"Комментарий: {comment or 'не указан'}"
+        )
+
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат ID. ID должен быть числом.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
+@admin_only
+async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для удаления пользователя из белого списка"""
+    try:
+        args = context.args
+        if len(args) < 1:
+            await update.message.reply_text(
+                "❌ Использование: /removeuser <user_id>\n"
+                "Пример: /removeuser 123456789"
+            )
+            return
+
+        user_id = int(args[0])
+
+        if not is_in_whitelist(user_id):
+            await update.message.reply_text(f"❌ Пользователь {user_id} не найден в белом списке.")
+            return
+
+        remove_from_whitelist(user_id)
+
+        with db._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE users SET is_authorized = 0 WHERE user_id = ?",
+                (user_id,)
+            )
+            conn.commit()
+
+        add_log(update.effective_user.id, "admin", "INFO", f"Удалил {user_id} из белого списка")
+
+        await update.message.reply_text(
+            f"✅ Пользователь {user_id} удалён из белого списка!\n"
+            f"Он больше не имеет доступа к боту."
+        )
+
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат ID. ID должен быть числом.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
+@admin_only
+async def whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для просмотра белого списка с форматированием даты"""
+    whitelist = get_whitelist()
+
+    if not whitelist:
+        await update.message.reply_text("📭 Белый список пуст.")
+        return
+
+    message = "📋 <b>Белый список:</b>\n\n"
+
+    for item in whitelist:
+        added_at = db.format_date(item['added_at'])
+
+        message += (
+            f"👤 ID: <code>{item['user_id']}</code>\n"
+            f"📝 {item['comment'] or 'нет'}\n"
+            f"📅 Добавлен: {added_at}\n\n"
+        )
+
+    try:
+        if len(message) > 4000:
+            message = "📋 <b>Белый список (последние 20):</b>\n\n"
+            for item in whitelist[-20:]:
+                added_at = db.format_date(item['added_at'])
+                message += f"• <code>{item['user_id']}</code> - {item['comment'] or '?'}\n"
+                message += f"  🕐 {added_at}\n\n"
+            await update.message.reply_text(message, parse_mode="HTML")
+        else:
+            await update.message.reply_text(message, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при отправке списка: {e}")
+        await update.message.reply_text(
+            "❌ Произошла ошибка при отправке списка.\n"
+            f"Детали: {e}"
+        )
+
+
+@admin_only
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для массовой рассылки сообщения всем пользователям"""
+    try:
+        args = context.args
+        if len(args) < 1:
+            await update.message.reply_text(
+                "❌ Использование: /broadcast <текст сообщения>\n"
+                "Пример: /broadcast 📢 Важное объявление!"
+            )
+            return
+
+        message_text = " ".join(args)
+
+        status_msg = await update.message.reply_text("📨 Начинаю рассылку...")
+
+        users = db.get_authorized_users()
+
+        if not users:
+            await status_msg.edit_text("📭 Нет авторизованных пользователей для рассылки.")
+            return
+
+        success_count = 0
+        fail_count = 0
+
+        for user_id in users:
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"📢 <b>Рассылка</b>\n\n{message_text}",
+                    parse_mode="HTML"
+                )
+                success_count += 1
+                await asyncio.sleep(0.05)
+            except Exception as e:
+                logger.error(f"❌ Ошибка отправки пользователю {user_id}: {e}")
+                fail_count += 1
+
+        result_message = (
+            f"✅ Рассылка завершена!\n\n"
+            f"📊 Статистика:\n"
+            f"• Успешно: {success_count}\n"
+            f"• Ошибок: {fail_count}\n"
+            f"• Всего: {len(users)}"
+        )
+        await status_msg.edit_text(result_message)
+
+        add_log(update.effective_user.id, "admin", "INFO",
+                f"Сделал рассылку: {success_count}/{len(users)} успешно")
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка в broadcast_command: {e}")
+        await update.message.reply_text(f"❌ Ошибка при рассылке: {e}")
+
+
+@admin_only
+async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для быстрого доступа к админ-панели (/ap и /adminpanel)"""
     user = update.effective_user
     user_id = user.id
     username = user.username or user.first_name
 
-    # Добавляем пользователя в БД
-    db.add_user(user.id, user.username, user.first_name)
-    logger.info(f"👤 Пользователь {user.id} сохранен в БД")
-    logger.info(f"👤 Пользователь @{username} (ID: {user_id}) вызвал команду /start")
-    set_user_state(user_id, 'MAIN_MENU')
+    logger.info(f"👑 Админ @{username} (ID: {user_id}) вызвал команду /ap")
+
+    whitelist = get_whitelist()
+    authorized_users = db.get_authorized_users()
+
+    message = (
+        "👑 <b>Админ панель</b>\n\n"
+        f"📊 <b>Статистика:</b>\n"
+        f"• В белом списке: {len(whitelist)}\n"
+        f"• Авторизовано: {len(authorized_users)}\n\n"
+        "<b>Команды (полные / сокращённые):</b>\n"
+        "• /adminpanel или /ap - эта панель\n"
+        "• /whitelist или /wl - список доступа\n"
+        "• <code>/adduser &lt;id&gt; [комментарий]</code> или <code>/au &lt;id&gt; [комментарий]</code>- добавить пользователя\n"
+        "• <code>/removeuser &lt;id&gt;</code> или <code>/ru &lt;id&gt;</code>- удалить пользователя\n"
+        "• <code>/broadcast &lt;текст&gt;</code> или <code>/bc &lt;текст&gt;</code> - массовая рассылка авторизованным пользователям\n\n"
+        "<b>Навигация:</b>"
+    )
 
     keyboard = [
-        [InlineKeyboardButton("📚 Показать задания", callback_data="show_hw")],
-        [InlineKeyboardButton("🔗 Ссылки сегодня", callback_data="links_today")],
-        [InlineKeyboardButton("❓ Помощь", callback_data="help_main")]
+        [InlineKeyboardButton("📋 Белый список", callback_data="admin_whitelist")],
+        [InlineKeyboardButton("📢 Сделать рассылку", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("◀️ В главное меню", callback_data="main_menu")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
-        f"👋 Привет, {user.first_name}!\n\n"
-        "Я бот для отслеживания домашних заданий и ссылок.\n"
-        "Выбери действие:",
-        reply_markup=reply_markup
+    if update.message:
+        await update.message.reply_text(
+            message,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+            disable_web_page_preview=True
+        )
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(
+            message,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+            disable_web_page_preview=True
+        )
+
+
+# Сокращённые команды
+@admin_only
+async def adduser_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сокращение для /adduser - /au"""
+    await add_user_command(update, context)
+
+
+@admin_only
+async def removeuser_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сокращение для /removeuser - /ru"""
+    await remove_user_command(update, context)
+
+
+@admin_only
+async def whitelist_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сокращение для /whitelist - /wl"""
+    await whitelist_command(update, context)
+
+
+@admin_only
+async def broadcast_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сокращение для /broadcast - /bc"""
+    await broadcast_command(update, context)
+
+
+@admin_only
+async def admin_panel_full_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Полная версия команды для доступа к админ-панели (/adminpanel)"""
+    await admin_panel_command(update, context)
+
+
+# ========== ЗАПРОС ДОСТУПА ==========
+async def request_access_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик запроса доступа"""
+    query = update.callback_query
+    user = update.effective_user
+    user_id = user.id
+    username = user.username or "нет"
+    first_name = user.first_name or "нет"
+
+    await query.answer()
+
+    if is_authorized(user_id):
+        await query.edit_message_text(
+            "✅ <b>Вы уже авторизованы!</b>\n\n"
+            "У вас есть полный доступ ко всем функциям бота.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 В главное меню", callback_data="main_menu")
+            ]])
+        )
+        return
+
+    if is_in_whitelist(user_id):
+        await query.edit_message_text(
+            "⏳ <b>Запрос уже отправлен</b>\n\n"
+            "Ваш запрос на доступ уже рассматривается администратором.\n"
+            "Пожалуйста, ожидайте.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 На главную", callback_data="main_menu")
+            ]])
+        )
+        return
+
+    add_log(user_id, "auth", "INFO", "Запрос доступа")
+
+    try:
+        admin_message = (
+            f"🔔 <b>Новый запрос доступа</b>\n\n"
+            f"👤 ID: <code>{user_id}</code>\n"
+            f"📝 Имя: {first_name}\n"
+            f"📱 Username: @{username}\n\n"
+            f"<b>Действия:</b>\n"
+            f"✅ Добавить: <code>/adduser {user_id} {first_name}</code>\n"
+            f"❌ Отклонить: игнорировать"
+        )
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=admin_message,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"❌ Не удалось отправить уведомление админу: {e}")
+
+    await query.edit_message_text(
+        "✅ <b>Запрос отправлен!</b>\n\n"
+        "Администратор рассмотрит вашу заявку в ближайшее время.\n"
+        "После подтверждения вы получите доступ к боту.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 На главную", callback_data="main_menu")
+        ]])
     )
+
+
+# ========== ОБРАБОТЧИКИ КОМАНД ==========
+
+async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    user = update.effective_user
+    user_id = user.id
+    username = user.username or user.first_name
+
+    add_user(user.id, user.username, user.first_name)
+    logger.info(f"👤 Пользователь @{username} (ID: {user_id}) вызвал команду /start")
+
+    if is_authorized(user_id):
+        set_user_state(user_id, 'MAIN_MENU')
+
+        subscribed = get_user_subscription(user_id)
+        sub_status = "✅ Включена" if subscribed else "❌ Отключена"
+
+        keyboard = [
+            [InlineKeyboardButton("📚 Показать задания", callback_data="show_hw")],
+            [InlineKeyboardButton("🔗 Ссылки сегодня", callback_data="links_today")],
+            [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
+            [InlineKeyboardButton("❓ Помощь", callback_data="help_main")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            f"👋 С возвращением, {user.first_name}!\n\n"
+            f"📊 Статус подписки: {sub_status}\n"
+            "Выбери действие:",
+            reply_markup=reply_markup
+        )
+    else:
+        if is_in_whitelist(user_id):
+            authorize_user(user_id)
+            add_log(user_id, "auth", "INFO", "Автоматическая авторизация")
+            logger.info(f"✅ Пользователь @{username} автоматически авторизован")
+            await start(update, _)
+        else:
+            keyboard = [[InlineKeyboardButton("🔑 Запросить доступ", callback_data="request_access")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(
+                "🔒 <b>Доступ ограничен</b>\n\n"
+                "Этот бот предназначен только для студентов группы.\n"
+                "Если вы из нашей группы, нажмите кнопку ниже для запроса доступа.\n\n"
+                "После проверки администратор добавит вас в белый список.",
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
 
 
 async def help_command(update: Update, _: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help"""
     user = update.effective_user
+    user_id = user.id
     username = user.username or user.first_name
 
     logger.info(f"👤 Пользователь @{username} вызвал команду /help")
@@ -650,14 +1302,28 @@ async def help_command(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "<b>Статусы заданий:</b>\n"
         "• 🔥 СЕГОДНЯ! - сдать сегодня\n"
         "• ⚠️ ЗАВТРА! - сдать завтра\n"
-        "• ⏰ N дн. - осталось N дней\n"
-        "• ❗️ ПРОСРОЧЕНО - задание просрочено\n\n"
+        "• ⏰ N дн. - сдать через N дней\n"
+        "• ❗️ ПРОСРОЧЕНО - задание просрочено (для отладки)\n\n"
+
+        "<b>Рассылка ссылок:</b>\n"
+        "• В настройках можно включить/отключить автоматическую рассылку\n"
+        "• При появлении новой ссылки она придёт всем подписанным пользователям\n"
+        "• Рассылка приходит только по подписке, можно отключить в любой момент\n\n"
 
         "<b>Обновление данных:</b>\n"
-        "• Задания обновляются ежедневно в 00:00 МСК\n"
         "• Дата последнего обновления показывается сверху\n"
         "• При ошибке показываются предыдущие данные\n\n"
     )
+
+    if user_id == ADMIN_ID:
+        help_text += (
+            "\n\n👑 <b>Команды администратора:</b>\n"
+            "• /adminpanel или /ap - админ панель\n"
+            "• /adduser или /au <id> [комментарий] - добавить пользователя\n"
+            "• /removeuser или /ru <id> - удалить пользователя\n"
+            "• /whitelist или /wl - список доступа\n"
+            "• /broadcast или /bc <текст> - массовая рассылка авторизованным пользователям\n"
+        )
 
     keyboard = [[InlineKeyboardButton("🏠 В главное меню", callback_data="main_menu")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -671,6 +1337,7 @@ async def help_command(update: Update, _: ContextTypes.DEFAULT_TYPE):
 
 
 @async_timer_decorator
+@authorized_only
 async def homework_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /hw"""
     user = update.effective_user
@@ -698,7 +1365,11 @@ async def homework_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if homework_data:
             set_user_state(user_id, 'TASKS_LIST')
 
-            message, keyboard = format_homework_page(homework_data, 0, current_filter=None)
+            message, keyboard = format_homework_page(
+                homework_data, 0,
+                current_filter=None,
+                context=context
+            )
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             await update.message.reply_text(
@@ -708,10 +1379,23 @@ async def homework_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True
             )
 
+            # Сохраняем просмотренные записи
+            seen_records = {}
+            for item in homework_data:
+                subject = item.get('Предмет')
+                due_date = item.get('Срок')
+                if subject and due_date and due_date != '-':
+                    record_id = f"{subject}_{due_date}"
+                    seen_records[record_id] = time.time()
+
             context.user_data['homework_data'] = homework_data
             context.user_data['current_page'] = 0
             context.user_data['last_update'] = time.time()
             context.user_data['data_version'] = _data_cache.get('version', 0)
+            context.user_data['seen_records'] = seen_records
+
+            # Важно: при первом просмотре не показываем уведомление
+            show_update_notice = False
         else:
             await update.message.reply_text("📭 В таблице нет заданий!")
 
@@ -737,8 +1421,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
+    if data in ["request_access", "main_menu", "help_main"]:
+        pass
+    else:
+        if not is_authorized(user_id):
+            if is_in_whitelist(user_id):
+                authorize_user(user_id)
+                add_log(user_id, "auth", "INFO", "Автоматическая авторизация")
+                logger.info(f"✅ Пользователь @{username} автоматически авторизован")
+            else:
+                keyboard = [[InlineKeyboardButton("🔑 Запросить доступ", callback_data="request_access")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                await query.edit_message_text(
+                    "🔒 <b>Доступ ограничен</b>\n\n"
+                    "Этот бот предназначен только для студентов группы.\n"
+                    "Если вы из нашей группы, нажмите кнопку ниже для запроса доступа.",
+                    parse_mode="HTML",
+                    reply_markup=reply_markup
+                )
+                return
+
     try:
-        # ===== КНОПКИ ГЛАВНОГО МЕНЮ =====
         if data == "help_main":
             set_user_state(user_id, 'HELP_MAIN')
 
@@ -753,9 +1457,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "<b>Команды:</b>\n"
                 "/hw - показать задания\n"
                 "/links - показать ссылки\n"
-                "/start - главное меню\n"
-                "/help - подробная справка\n\n"
-                
+                "/help - подробная справка\n"
+                "/start - главное меню\n\n"
                 "<b>Навигация:</b>\n"
                 "🏠 Главное меню - вернуться на главную"
             )
@@ -774,17 +1477,170 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"🏠 Пользователь {username} вернулся в главное меню")
             set_user_state(user_id, 'MAIN_MENU')
 
+            subscribed = get_user_subscription(user_id)
+            sub_status = "✅ Включена" if subscribed else "❌ Отключена"
+
             keyboard = [
                 [InlineKeyboardButton("📚 Показать задания", callback_data="show_hw")],
                 [InlineKeyboardButton("🔗 Ссылки сегодня", callback_data="links_today")],
+                [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
                 [InlineKeyboardButton("❓ Помощь", callback_data="help_main")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             await query.edit_message_text(
-                "👋 Главное меню:",
+                f"👋 Главное меню\n\n📊 Статус подписки: {sub_status}",
                 reply_markup=reply_markup
             )
+
+        elif data == "settings":
+            set_user_state(user_id, 'SETTINGS')
+            await settings_menu(update, context)
+
+        elif data == "toggle_subscription":
+            await toggle_subscription_handler(update, context)
+
+        elif data == "admin_panel":
+            await admin_panel(update, context)
+
+        elif data == "admin_whitelist":
+            await admin_whitelist(update, context)
+
+        elif data == "admin_broadcast":
+            context.user_data['awaiting_broadcast'] = True
+            context.user_data['broadcast_step'] = 'waiting_message'
+
+            await query.edit_message_text(
+                "📢 <b>Создание рассылки - Шаг 1/2</b>\n\n"
+                "✍️ <b>Введите текст рассылки</b>\n\n"
+                "Вы можете использовать HTML-разметку:\n"
+                f"• <code>&lt;b&gt;текст&lt;/b&gt;</code> - жирный\n"
+                f"• <code>&lt;i&gt;текст&lt;/i&gt;</code> - курсив\n"
+                f"• <code>&lt;u&gt;текст&lt;/u&gt;</code> - подчёркнутый\n"
+                f"• <code>&lt;s&gt;текст&lt;/s&gt;</code> - зачёркнутый\n"
+                f"• <code>&lt;a href=\"ссылка\"&gt;текст&lt;/a&gt;</code> - ссылка\n"
+                f"• <code>&lt;code&gt;текст&lt;/code&gt;</code> - моноширинный\n"
+                f"• <code>&lt;pre&gt;текст&lt;/pre&gt;</code> - блок кода\n\n"
+                "📝 Просто напишите сообщение в этот чат.\n"
+                "Я его запомню и покажу предпросмотр.\n\n"
+                "Для отмены напишите /cancel или нажмите кнопку ниже",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Отменить", callback_data="admin_panel")
+                ]])
+            )
+
+        elif data == "broadcast_edit":
+            context.user_data['broadcast_step'] = 'editing'
+
+            current_text = context.user_data.get('broadcast_message', '')
+            escaped_text = current_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+            await query.edit_message_text(
+                f"✏️ <b>Изменение рассылки</b>\n\n"
+                f"📝 <b>Текущий текст:</b>\n"
+                f"{escaped_text}\n\n"
+                f"{'―' * 20}\n"
+                f"Отправьте новый текст сообщения.\n\n"
+                f"После отправки вы вернётесь к предпросмотру.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Вернуться к предпросмотру", callback_data="broadcast_preview")],
+                    [InlineKeyboardButton("❌ Отменить рассылку", callback_data="admin_panel")]
+                ])
+            )
+
+        elif data == "broadcast_preview":
+            message_text = context.user_data.get('broadcast_message', '')
+            context.user_data['broadcast_step'] = 'confirm'
+
+            escaped_text = message_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+            preview = (
+                f"📢 <b>Предпросмотр рассылки</b>\n\n"
+                f"<b>🔍 КАК БУДЕТ ВЫГЛЯДЕТЬ:</b>\n"
+                f"{message_text}\n\n"
+                f"<b>📋 ИСХОДНЫЙ КОД (с тегами):</b>\n"
+                f"<code>{escaped_text}</code>\n\n"
+                f"{'―' * 30}\n"
+                f"✅ <b>Подтверждение</b>\n\n"
+                f"Отправить это сообщение всем пользователям?"
+            )
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Отправить", callback_data="broadcast_confirm"),
+                    InlineKeyboardButton("✏️ Изменить", callback_data="broadcast_edit")
+                ],
+                [InlineKeyboardButton("❌ Отменить", callback_data="admin_panel")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                preview,
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+
+        elif data == "broadcast_confirm":
+            await query.edit_message_text("📨 Начинаю рассылку...")
+
+            message_text = context.user_data.get('broadcast_message')
+
+            users = db.get_authorized_users()
+
+            if not users:
+                await query.edit_message_text(
+                    "📭 Нет авторизованных пользователей для рассылки.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")
+                    ]])
+                )
+                context.user_data.pop('awaiting_broadcast', None)
+                context.user_data.pop('broadcast_step', None)
+                context.user_data.pop('broadcast_message', None)
+                return
+
+            success_count = 0
+            fail_count = 0
+
+            for user_id in users:
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"📢 <b>Рассылка</b>\n\n{message_text}",
+                        parse_mode="HTML"
+                    )
+                    success_count += 1
+                    await asyncio.sleep(0.05)
+                except Exception as e:
+                    logger.error(f"❌ Ошибка отправки пользователю {user_id}: {e}")
+                    fail_count += 1
+
+            result = (
+                f"✅ <b>Рассылка завершена!</b>\n\n"
+                f"📊 Статистика:\n"
+                f"• Успешно: {success_count}\n"
+                f"• Ошибок: {fail_count}\n"
+                f"• Всего: {len(users)}"
+            )
+
+            await query.edit_message_text(
+                result,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Назад в админку", callback_data="admin_panel")
+                ]])
+            )
+
+            add_log(user_id, "admin", "INFO", f"Рассылка: {success_count}/{len(users)} успешно")
+
+            context.user_data.pop('awaiting_broadcast', None)
+            context.user_data.pop('broadcast_step', None)
+            context.user_data.pop('broadcast_message', None)
+
+        elif data == "request_access":
+            await request_access_handler(update, context)
 
         elif data == "links_today":
             set_user_state(user_id, 'LINKS')
@@ -811,7 +1667,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True
             )
 
-        # ===== КНОПКИ СПИСКА ЗАДАНИЙ =====
         elif data == "show_hw":
             logger.info(f"📚 Пользователь {username} запросил задания")
 
@@ -823,7 +1678,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if homework_data:
                     set_user_state(user_id, 'TASKS_LIST')
 
-                    message, keyboard = format_homework_page(homework_data, 0, current_filter=None)
+                    message, keyboard = format_homework_page(
+                        homework_data, 0,
+                        current_filter=None,
+                        context=context
+                    )
                     reply_markup = InlineKeyboardMarkup(keyboard)
 
                     await query.edit_message_text(
@@ -833,10 +1692,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         disable_web_page_preview=True
                     )
 
+                    # Сохраняем просмотренные записи
+                    seen_records = {}
+                    for item in homework_data:
+                        subject = item.get('Предмет')
+                        due_date = item.get('Срок')
+                        if subject and due_date and due_date != '-':
+                            record_id = f"{subject}_{due_date}"
+                            seen_records[record_id] = time.time()
+
                     context.user_data['homework_data'] = homework_data
                     context.user_data['current_page'] = 0
                     context.user_data['last_update'] = time.time()
                     context.user_data['data_version'] = _data_cache.get('version', 0)
+                    context.user_data['seen_records'] = seen_records
+
+                    # Важно: при первом просмотре не показываем уведомление
+                    show_update_notice = False
                 else:
                     await query.edit_message_text("📭 В таблице нет заданий!")
             except Exception as e:
@@ -852,18 +1724,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_user_state(user_id, 'HELP_TASKS')
 
             help_text = (
-                "📚 <b>Помощь по боту</b>\n\n"
-                "<b>Что я умею:</b>\n"
-                "• Показывать домашние задания из таблицы\n"
-                "• Отображать гиперссылки в заданиях\n"
-                "• Присылать ссылки\n"
-                "• Фильтровать по срокам\n\n"
-
-                "<b>Команды:</b>\n"
-                "/hw - показать задания\n"
-                "/links - показать ссылки\n"
-                "/start - главное меню\n"
-                "/help - подробная справка"
+                "📚 <b>Работа с заданиями</b>\n\n"
+                "<b>Кнопки:</b>\n"
+                "◀️ Назад / Вперед ▶️ - листать страницы\n"
+                "🔄 Обновить - загрузить свежие данные\n"
+                "📅 Сегодня - показать задания на сегодня\n"
+                "🏠 Главное меню - вернуться на главную\n\n"
+                "<b>Статусы:</b>\n"
+                "🔥 СЕГОДНЯ! - сдать сегодня\n"
+                "⚠️ ЗАВТРА! - сдать завтра\n"
+                "⏰ N дн. - сдать через N дней\n"
+                "❗️ ПРОСРОЧЕНО - задание просрочено (для отладки)"
             )
 
             keyboard = [[InlineKeyboardButton("◀️ Назад к заданиям", callback_data="back_to_tasks")]]
@@ -889,7 +1760,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     homework_data,
                     current_page,
                     show_update_notice=has_updates,
-                    current_filter=None
+                    current_filter=None,
+                    context=context
                 )
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -918,7 +1790,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if new_data:
                     set_user_state(user_id, 'TASKS_LIST')
 
-                    message, keyboard = format_homework_page(new_data, 0, current_filter=None)
+                    message, keyboard = format_homework_page(
+                        new_data, 0,
+                        current_filter=None,
+                        context=context
+                    )
                     reply_markup = InlineKeyboardMarkup(keyboard)
 
                     await query.edit_message_text(
@@ -928,10 +1804,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         disable_web_page_preview=True
                     )
 
+                    # Сохраняем просмотренные записи
+                    seen_records = {}
+                    for item in new_data:
+                        subject = item.get('Предмет')
+                        due_date = item.get('Срок')
+                        if subject and due_date and due_date != '-':
+                            record_id = f"{subject}_{due_date}"
+                            seen_records[record_id] = time.time()
+
                     context.user_data['homework_data'] = new_data
                     context.user_data['current_page'] = 0
                     context.user_data['last_update'] = time.time()
                     context.user_data['data_version'] = _data_cache.get('version', 0)
+                    context.user_data['seen_records'] = seen_records
 
                     logger.info(f"✅ Данные обновлены для {username}")
                 else:
@@ -974,7 +1860,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 homework_data,
                 page,
                 show_update_notice=has_updates,
-                current_filter=None
+                current_filter=None,
+                context=context
             )
             reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -1006,7 +1893,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             today = datetime.now().date()
             filtered = []
             for item in homework_data:
-                date_str = item.get('Срок', '')
+                date_str = item.get('Срок')
                 if date_str:
                     try:
                         due = datetime.strptime(date_str, "%d.%m.%Y").date()
@@ -1021,7 +1908,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 message, keyboard = format_homework_page(
                     filtered,
                     0,
-                    current_filter='today'
+                    current_filter='today',
+                    context=context
                 )
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -1044,7 +1932,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
     except Exception as e:
-        logger.error(f"❌ Ошибка в кнопке {data}: {e}", exc_info=True)
+        logger.error(f"❌ Ошибка в кнопке: {data}: {e}", exc_info=True)
         try:
             await query.edit_message_text(
                 f"❌ Произошла ошибка. {MESSAGES['start']}",
@@ -1055,12 +1943,107 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+# ========== ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ ==========
+async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает текстовые сообщения для создания рассылки"""
+    user = update.effective_user
+    user_id = user.id
+
+    if user_id != ADMIN_ID or not context.user_data.get('awaiting_broadcast'):
+        return
+
+    step = context.user_data.get('broadcast_step')
+    message_text = update.message.text
+
+    allowed_tags = ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'a', 'code', 'pre']
+
+    import re
+    forbidden_tags = re.findall(r'<(\w+)[^>]*>', message_text)
+    for tag in forbidden_tags:
+        if tag.lower() not in allowed_tags and not tag.startswith('/'):
+            await update.message.reply_text(
+                f"❌ <b>Недопустимый HTML-тег</b>\n\n"
+                f"Тег <code>&lt;{tag}&gt;</code> не поддерживается Telegram.\n\n"
+                f"Поддерживаются только:\n"
+                f"• <code>&lt;b&gt;</code> - жирный\n"
+                f"• <code>&lt;i&gt;</code> - курсив\n"
+                f"• <code>&lt;u&gt;</code> - подчёркнутый\n"
+                f"• <code>&lt;s&gt;</code> - зачёркнутый\n"
+                f"• <code>&lt;a href=\"\"&gt;</code> - ссылка\n"
+                f"• <code>&lt;code&gt;</code> - моноширинный\n"
+                f"• <code>&lt;pre&gt;</code> - блок кода\n\n"
+                f"Пожалуйста, уберите этот тег и отправьте сообщение снова.",
+                parse_mode="HTML"
+            )
+            return
+
+    context.user_data['broadcast_message'] = message_text
+    context.user_data['broadcast_step'] = 'confirm'
+
+    escaped_text = message_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+    preview = (
+        f"📢 <b>Предпросмотр рассылки</b>\n\n"
+        f"<b>🔍 КАК БУДЕТ ВЫГЛЯДЕТЬ:</b>\n"
+        f"{message_text}\n\n"
+        f"<b>📋 ИСХОДНЫЙ КОД (с тегами):</b>\n"
+        f"<code>{escaped_text}</code>\n\n"
+        f"{'―' * 30}\n"
+        f"✅ <b>Подтверждение</b>\n\n"
+        f"Отправить это сообщение всем пользователям?"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Отправить", callback_data="broadcast_confirm"),
+            InlineKeyboardButton("✏️ Изменить", callback_data="broadcast_edit")
+        ],
+        [InlineKeyboardButton("❌ Отменить", callback_data="admin_panel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        preview,
+        parse_mode="HTML",
+        reply_markup=reply_markup
+    )
+
+
+# ========== ОБРАБОТЧИК КОМАНДЫ /CANCEL ==========
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена текущего действия"""
+    user = update.effective_user
+
+    if user.id != ADMIN_ID:
+        await update.message.reply_text("❌ У вас нет прав для этой команды.")
+        return
+
+    if context.user_data.get('awaiting_broadcast'):
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Да, отменить", callback_data="admin_panel"),
+                InlineKeyboardButton("❌ Нет, продолжить", callback_data="broadcast_preview")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            "❓ <b>Отмена рассылки</b>\n\n"
+            "Вы уверены, что хотите отменить создание рассылки?\n"
+            "Все введённые данные будут потеряны.",
+            parse_mode="HTML",
+            reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text("Нет активных действий для отмены.")
+
+
 # ========== ЗАПУСК БОТА ==========
 
 def main():
     """Главная функция запуска бота"""
     logger.info("=" * 60)
-    logger.info("🚀 ЗАПУСК ФИНАЛЬНОЙ ВЕРСИИ БОТА")
+    logger.info("🚀 ЗАПУСК БОТА")
     logger.info("=" * 60)
 
     logger.info(f"📊 Настройки:")
@@ -1074,65 +2057,48 @@ def main():
     logger.info(f"  • Защита от спама: {REQUEST_COOLDOWN} сек")
     logger.info(f"  • Часовой пояс: Europe/Moscow (UTC+3)")
     logger.info(f"  • Текущее время МСК: {format_moscow_time()}")
+    logger.info(f"  • Администратор ID: {ADMIN_ID}")
 
-    # Запускаем фоновую проверку обновлений заданий
     updater_thread = threading.Thread(target=background_cache_updater, daemon=True)
     updater_thread.start()
     logger.info("✅ Фоновая проверка обновлений заданий запущена")
 
-    # Создаём приложение с настройками для многозадачности
     app = Application.builder() \
         .token(TELEGRAM_TOKEN) \
         .concurrent_updates(True) \
         .build()
 
-    # Увеличиваем количество worker-ов для обработки
     if hasattr(app, 'dispatcher'):
         app.dispatcher.workers = 8
         logger.info("✅ Количество worker-ов увеличено до 8")
 
-    # Добавляем фоновые задачи
     job_queue = app.job_queue
 
-    # Проверка ссылок каждые 5 минут
     job_queue.run_repeating(check_links_job, interval=300, first=10)
     logger.info("✅ Фоновая проверка ссылок запущена (интервал 5 минут)")
 
-    # Ежедневное обновление в 00:00 МСК
-    try:
-        # Получаем текущее время в Москве
-        now_moscow = get_moscow_time()
-
-        # Вычисляем следующую полночь по Москве
-        next_midnight = now_moscow.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-
-        # Конвертируем в UTC для планировщика (он работает в UTC)
-        next_midnight_utc = next_midnight.astimezone(UTC_TZ)
-        now_utc = datetime.now(UTC_TZ)
-
-        # Секунды до следующей полуночи по Москве
-        seconds_until_midnight = (next_midnight_utc - now_utc).total_seconds()
-
-        # Запускаем ежедневное обновление
-        job_queue.run_repeating(
-            daily_update_job,
-            interval=86400,  # 24 часа
-            first=seconds_until_midnight
-        )
-        logger.info(f"✅ Ежедневное обновление запланировано на {next_midnight.strftime('%H:%M')} МСК")
-
-    except Exception as e:
-        logger.error(f"⚠️ Ошибка при планировании обновления: {e}")
-        # Запасной вариант - обновление каждые 6 часов
-        job_queue.run_repeating(daily_update_job, interval=21600, first=3600)
-        logger.info("✅ Использую запасной вариант: обновление каждые 6 часов")
-
-    # Добавляем обработчики команд
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("hw", homework_command))
     app.add_handler(CommandHandler("links", links_command))
+
+    # Админ-команды
+    app.add_handler(CommandHandler("adduser", add_user_command))
+    app.add_handler(CommandHandler("removeuser", remove_user_command))
+    app.add_handler(CommandHandler("whitelist", whitelist_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("ap", admin_panel_command))
+    app.add_handler(CommandHandler("adminpanel", admin_panel_full_command))
+
+    # Сокращённые админ-команды
+    app.add_handler(CommandHandler("au", adduser_shortcut))
+    app.add_handler(CommandHandler("ru", removeuser_shortcut))
+    app.add_handler(CommandHandler("wl", whitelist_shortcut))
+    app.add_handler(CommandHandler("bc", broadcast_shortcut))
+
+    app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_broadcast_message))
 
     logger.info("✅ Обработчики команд зарегистрированы")
     logger.info("📍 Будет вестись лог состояний пользователей")
