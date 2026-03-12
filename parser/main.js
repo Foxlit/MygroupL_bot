@@ -254,35 +254,48 @@ async function extractAndSaveLink(parTitle) {
         console.log('📁 Ссылка сохранена в link.txt');
 
         // Сохраняем в БД
-        try {
-            const db = new sqlite3.Database(dbPath);
+    try {
+        const db = new sqlite3.Database(dbPath);
 
-            // Проверяем существование таблицы и создаём если нет
-            db.run(`
-                CREATE TABLE IF NOT EXISTS links (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    par_name TEXT NOT NULL,
-                    link TEXT NOT NULL,
-                    parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    notified BOOLEAN DEFAULT 0
-                )
-            `);
+        // Создаём таблицу, если её нет
+        db.run(`
+            CREATE TABLE IF NOT EXISTS links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                par_name TEXT NOT NULL,
+                link TEXT NOT NULL,
+                parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                notified BOOLEAN DEFAULT 0
+            )
+        `, function(err) {
+            if (err) {
+                console.error('❌ Ошибка создания таблицы:', err);
+            } else {
+                console.log('✅ Таблица links проверена/создана');
 
-            db.run(
-                "INSERT INTO links (par_name, link) VALUES (?, ?)",
-                [parTitle, finalUrl],
-                function(err) {
-                    if (err) {
-                        console.error('❌ Ошибка сохранения в БД:', err);
-                    } else {
-                        console.log('✅ Ссылка сохранена в БД (ID: ' + this.lastID + ')');
+                // Сохраняем ссылку
+                db.run(
+                    "INSERT INTO links (par_name, link) VALUES (?, ?)",
+                    [parTitle, finalUrl],
+                    function(err) {
+                        if (err) {
+                            console.error('❌ Ошибка сохранения в БД:', err);
+                        } else {
+                            console.log('✅ Ссылка сохранена в БД (ID: ' + this.lastID + ')');
+                        }
                     }
-                }
-            );
+                );
+            }
+        });
+
+        // Даём время на выполнение запросов перед закрытием
+        setTimeout(() => {
             db.close();
-        } catch (dbErr) {
-            console.error('❌ Ошибка подключения к БД:', dbErr);
-        }
+            console.log('🔒 Соединение с БД закрыто');
+        }, 500);
+
+    } catch (dbErr) {
+        console.error('❌ Ошибка подключения к БД:', dbErr);
+    }
 
     } catch (error) {
         console.error('❌ Ошибка:', error);
