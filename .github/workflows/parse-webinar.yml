@@ -3,7 +3,7 @@ name: Парсинг ссылок на пары
 on:
   schedule:
     - cron: '11 14 * * 1-5'  # 17:11 МСК
-    - cron: '30 15 * * 1-5'  # 18:30 МСК
+    - cron: '00 16 * * 1-5'  # 19:00 МСК
   workflow_dispatch:
     inputs:
       subject:
