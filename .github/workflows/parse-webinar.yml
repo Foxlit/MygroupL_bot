@@ -81,20 +81,27 @@ jobs:
         run: |
           if [ -f parser/link.txt ]; then
             LINK=$(cat parser/link.txt)
-            SUBJECT="${{ steps.subject.outputs.name }}"
+            SUBJECT="${{ steps.schedule.outputs.subject }}"
 
             # Создаём папку если нет
             mkdir -p shared-data
 
-            # Сохраняем в SQLite
-            sqlite3 shared-data/bot_data.db <<EOF
+            # Сохраняем в SQLite - ИСПРАВЛЕНО!
+            sqlite3 shared-data/bot_data.db << 'EOF'
+            CREATE TABLE IF NOT EXISTS links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                par_name TEXT NOT NULL,
+                link TEXT NOT NULL,
+                parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                notified BOOLEAN DEFAULT 0
+            );
             INSERT INTO links (par_name, link) VALUES ('$SUBJECT', '$LINK');
             EOF
 
             echo "✅ Ссылка сохранена в БД: $SUBJECT"
             echo "🔗 $LINK"
           else
-            echo "⚠️ Файл link.txt не найден (возможно, ссылка ещё не появилась)"
+            echo "⚠️ Файл link.txt не найден"
           fi
 
       - name: Upload database as artifact
