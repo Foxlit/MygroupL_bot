@@ -376,6 +376,12 @@ class Database:
                 ORDER BY parsed_at DESC
             """)
             return [dict(row) for row in cursor.fetchall()]
+    
+    def format_username(self, username):
+        """Форматирует username с @ или 'нет'"""
+        if username and username != 'нет' and username != 'None':
+            return f"@{username}"
+        return "нет"
 
     # ===== ЛОГИРОВАНИЕ =====
 
