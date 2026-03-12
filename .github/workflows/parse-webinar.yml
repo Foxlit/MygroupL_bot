@@ -86,17 +86,8 @@ jobs:
             # Создаём папку если нет
             mkdir -p shared-data
 
-            # Сохраняем в SQLite - ИСПРАВЛЕНО!
-            sqlite3 shared-data/bot_data.db << 'EOF'
-            CREATE TABLE IF NOT EXISTS links (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                par_name TEXT NOT NULL,
-                link TEXT NOT NULL,
-                parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                notified BOOLEAN DEFAULT 0
-            );
-            INSERT INTO links (par_name, link) VALUES ('$SUBJECT', '$LINK');
-            EOF
+            sqlite3 shared-data/bot_data.db "CREATE TABLE IF NOT EXISTS links (id INTEGER PRIMARY KEY AUTOINCREMENT, par_name TEXT NOT NULL, link TEXT NOT NULL, parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, notified BOOLEAN DEFAULT 0);"
+            sqlite3 shared-data/bot_data.db "INSERT INTO links (par_name, link) VALUES ('$SUBJECT', '$LINK');"
 
             echo "✅ Ссылка сохранена в БД: $SUBJECT"
             echo "🔗 $LINK"
