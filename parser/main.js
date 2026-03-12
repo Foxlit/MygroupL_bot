@@ -9,7 +9,7 @@ require("dotenv").config();
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function ensureDatabase() {
-    """Проверяет существование БД и создаёт таблицу если нужно"""
+    //Проверяет существование БД и создаёт таблицу если нужно
     const dbPath = path.join(__dirname, '..', 'shared-data', 'bot_data.db');
     console.log(`📁 Путь к БД: ${dbPath}`);
 
