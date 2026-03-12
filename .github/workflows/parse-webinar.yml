@@ -86,14 +86,18 @@ jobs:
             # Создаём папку если нет
             mkdir -p shared-data
 
-            # ✅ СОЗДАЁМ ТАБЛИЦУ (если не существует)
+            # Создаём таблицу если нет
             sqlite3 shared-data/bot_data.db "CREATE TABLE IF NOT EXISTS links (id INTEGER PRIMARY KEY AUTOINCREMENT, par_name TEXT NOT NULL, link TEXT NOT NULL, parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, notified BOOLEAN DEFAULT 0);"
 
-            # ✅ СОХРАНЯЕМ ССЫЛКУ
+            # Сохраняем ссылку
             sqlite3 shared-data/bot_data.db "INSERT INTO links (par_name, link) VALUES ('$SUBJECT', '$LINK');"
 
             echo "✅ Ссылка сохранена в БД: $SUBJECT"
             echo "🔗 $LINK"
+
+            # Проверяем, что сохранилось
+            echo "📊 Последние записи в БД:"
+            sqlite3 shared-data/bot_data.db "SELECT * FROM links ORDER BY id DESC LIMIT 3;"
           else
             echo "⚠️ Файл link.txt не найден"
           fi
