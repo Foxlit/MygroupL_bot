@@ -1,3 +1,4 @@
+
 """
 Модуль для работы с SQLite базой данных
 Автоматически сгенерирован скриптом init_db.py
@@ -13,24 +14,24 @@ DB_PATH = Path(__file__).parent / "shared-data" / "bot_data.db"
 
 class Database:
     """Класс для работы с базой данных"""
-
+    
     def __init__(self, db_path=None):
         self.db_path = db_path or DB_PATH
         self._ensure_db_exists()
-
+    
     def _ensure_db_exists(self):
         """Проверяет существование БД"""
         if not self.db_path.exists():
             raise FileNotFoundError(f"База данных не найдена: {self.db_path}")
-
+    
     def _get_connection(self):
         """Возвращает подключение к БД"""
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
         return conn
-
+    
     # ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
-
+    
     def format_date(self, date_str):
         """Преобразует дату из ISO в европейский формат"""
         if not date_str:
@@ -53,9 +54,15 @@ class Database:
                 return date_str
         except:
             return date_str
-
+    
+    def format_username(self, username):
+        """Форматирует username с @ или 'нет'"""
+        if username and username != 'нет' and username != 'None':
+            return f"@{username}"
+        return "нет"
+    
     # ===== РАБОТА С ПОЛЬЗОВАТЕЛЯМИ =====
-
+    
     def add_user(self, user_id: int, username: str = None, first_name: str = None):
         """Добавляет или обновляет пользователя"""
         with self._get_connection() as conn:
@@ -69,17 +76,7 @@ class Database:
                     last_active = CURRENT_TIMESTAMP
             """, (user_id, username, first_name))
             conn.commit()
-
-    def remove_from_whitelist(self, user_id: int):
-        """Удаляет пользователя из белого списка"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "DELETE FROM whitelist WHERE user_id = ?",
-                (user_id,)
-            )
-            conn.commit()
-
+    
     def is_user_authorized(self, user_id: int) -> bool:
         """Проверяет, авторизован ли пользователь"""
         with self._get_connection() as conn:
@@ -90,7 +87,7 @@ class Database:
             )
             row = cursor.fetchone()
             return bool(row and row['is_authorized'])
-
+    
     def authorize_user(self, user_id: int):
         """Авторизует пользователя"""
         with self._get_connection() as conn:
@@ -101,64 +98,144 @@ class Database:
                 WHERE user_id = ?
             """, (user_id,))
             conn.commit()
-
+    
+    # ===== ПОДПИСКИ =====
+    
     def get_user_subscription(self, user_id: int) -> bool:
-        """Проверяет подписку пользователя"""
+        """Проверяет подписку на ссылки"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT subscribed FROM users WHERE user_id = ?",
+                "SELECT subscribed_links FROM users WHERE user_id = ?",
                 (user_id,)
             )
             row = cursor.fetchone()
-            return bool(row and row['subscribed'])
-
+            return bool(row and row['subscribed_links'])
+    
     def toggle_subscription(self, user_id: int) -> bool:
-        """Переключает подписку пользователя"""
+        """Переключает подписку на ссылки"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-
-            # Получаем текущий статус
-            cursor.execute("SELECT subscribed FROM users WHERE user_id = ?", (user_id,))
+            
+            cursor.execute("SELECT subscribed_links FROM users WHERE user_id = ?", (user_id,))
             current = cursor.fetchone()
-
+            
             if not current:
-                # Если пользователя нет, создаём с подпиской
                 cursor.execute("""
-                    INSERT INTO users (user_id, subscribed) 
+                    INSERT INTO users (user_id, subscribed_links) 
                     VALUES (?, 1)
                 """, (user_id,))
                 conn.commit()
                 return True
-
-            # Переключаем
-            new_status = not current['subscribed']
+            
+            new_status = not current['subscribed_links']
             cursor.execute(
-                "UPDATE users SET subscribed = ? WHERE user_id = ?",
+                "UPDATE users SET subscribed_links = ? WHERE user_id = ?",
                 (new_status, user_id)
             )
             conn.commit()
             return new_status
-
+    
+    def get_user_homework_subscription(self, user_id: int) -> bool:
+        """Проверяет подписку на напоминания о ДЗ"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT subscribed_homework FROM users WHERE user_id = ?",
+                (user_id,)
+            )
+            row = cursor.fetchone()
+            return bool(row and row['subscribed_homework'])
+    
+    def toggle_homework_subscription(self, user_id: int) -> bool:
+        """Переключает подписку на напоминания о ДЗ"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT subscribed_homework FROM users WHERE user_id = ?", (user_id,))
+            current = cursor.fetchone()
+            
+            if not current:
+                cursor.execute("""
+                    INSERT INTO users (user_id, subscribed_homework) 
+                    VALUES (?, 1)
+                """, (user_id,))
+                conn.commit()
+                return True
+            
+            new_status = not current['subscribed_homework']
+            cursor.execute(
+                "UPDATE users SET subscribed_homework = ? WHERE user_id = ?",
+                (new_status, user_id)
+            )
+            conn.commit()
+            return new_status
+    
+    def get_user_reminder_days(self, user_id: int) -> List[int]:
+        """Получает настройки дней для напоминаний"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT homework_reminder_days FROM users WHERE user_id = ?",
+                (user_id,)
+            )
+            row = cursor.fetchone()
+            if row and row['homework_reminder_days']:
+                return [int(x.strip()) for x in row['homework_reminder_days'].split(',') if x.strip().isdigit()]
+            return [0, 1, 2, 3, 7]  # По умолчанию
+    
+    def set_user_reminder_days(self, user_id: int, days: List[int]) -> bool:
+        """Устанавливает настройки дней для напоминаний"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            days_str = ','.join(str(d) for d in sorted(set(days)))
+            cursor.execute(
+                "UPDATE users SET homework_reminder_days = ? WHERE user_id = ?",
+                (days_str, user_id)
+            )
+            conn.commit()
+            return True
+    
+    def get_user_reminder_time(self, user_id: int) -> str:
+        """Получает время для напоминаний"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT homework_reminder_time FROM users WHERE user_id = ?",
+                (user_id,)
+            )
+            row = cursor.fetchone()
+            return row['homework_reminder_time'] if row else '12:00'
+    
+    def set_user_reminder_time(self, user_id: int, time_str: str) -> bool:
+        """Устанавливает время для напоминаний"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE users SET homework_reminder_time = ? WHERE user_id = ?",
+                (time_str, user_id)
+            )
+            conn.commit()
+            return True
+    
     def get_subscribed_users(self) -> List[int]:
-        """Получает список подписанных пользователей"""
+        """Получает список подписанных на ссылки пользователей"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT user_id FROM users 
-                WHERE subscribed = 1 AND is_authorized = 1
+                WHERE subscribed_links = 1 AND is_authorized = 1
             """)
             return [row[0] for row in cursor.fetchall()]
-
+    
     def get_authorized_users(self) -> List[int]:
         """Получает список авторизованных пользователей"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT user_id FROM users WHERE is_authorized = 1")
             return [row[0] for row in cursor.fetchall()]
-
+    
     # ===== РАБОТА С БЕЛЫМ СПИСКОМ =====
-
+    
     def is_in_whitelist(self, user_id: int) -> bool:
         """Проверяет, есть ли пользователь в белом списке"""
         with self._get_connection() as conn:
@@ -168,7 +245,7 @@ class Database:
                 (user_id,)
             )
             return cursor.fetchone() is not None
-
+    
     def add_to_whitelist(self, user_id: int, added_by: int, comment: str = ""):
         """Добавляет пользователя в белый список"""
         with self._get_connection() as conn:
@@ -178,7 +255,7 @@ class Database:
                 VALUES (?, ?, ?)
             """, (user_id, added_by, comment))
             conn.commit()
-
+    
     def remove_from_whitelist(self, user_id: int):
         """Удаляет пользователя из белого списка"""
         with self._get_connection() as conn:
@@ -188,7 +265,7 @@ class Database:
                 (user_id,)
             )
             conn.commit()
-
+    
     def get_whitelist(self) -> List[Dict]:
         """Получает весь белый список"""
         with self._get_connection() as conn:
@@ -197,9 +274,9 @@ class Database:
                 SELECT * FROM whitelist ORDER BY added_at DESC
             """)
             return [dict(row) for row in cursor.fetchall()]
-
+    
     # ===== РАБОТА СО ССЫЛКАМИ =====
-
+    
     def save_link(self, par_name: str, link: str) -> int:
         """Сохраняет ссылку"""
         with self._get_connection() as conn:
@@ -210,7 +287,7 @@ class Database:
             )
             conn.commit()
             return cursor.lastrowid
-
+    
     def get_pending_links(self) -> List[Dict]:
         """Получает неотправленные ссылки"""
         with self._get_connection() as conn:
@@ -221,7 +298,7 @@ class Database:
                 ORDER BY parsed_at DESC
             """)
             return [dict(row) for row in cursor.fetchall()]
-
+    
     def mark_link_notified(self, link_id: int):
         """Отмечает ссылку как отправленную"""
         with self._get_connection() as conn:
@@ -231,7 +308,7 @@ class Database:
                 (link_id,)
             )
             conn.commit()
-
+    
     def get_today_links(self) -> List[Dict]:
         """Получает сегодняшние ссылки"""
         with self._get_connection() as conn:
@@ -243,14 +320,8 @@ class Database:
             """)
             return [dict(row) for row in cursor.fetchall()]
     
-    def format_username(self, username):
-        """Форматирует username с @ или 'нет'"""
-        if username and username != 'нет' and username != 'None':
-            return f"@{username}"
-        return "нет"
-
     # ===== ЛОГИРОВАНИЕ =====
-
+    
     def add_log(self, user_id: int, action: str, level: str, message: str):
         """Добавляет запись в лог"""
         with self._get_connection() as conn:
@@ -271,10 +342,6 @@ def add_user(user_id, username=None, first_name=None):
     db.add_user(user_id, username, first_name)
 
 
-def remove_from_whitelist(user_id):
-    db.remove_from_whitelist(user_id)
-
-
 def is_authorized(user_id):
     return db.is_user_authorized(user_id)
 
@@ -289,6 +356,30 @@ def get_user_subscription(user_id):
 
 def toggle_subscription(user_id):
     return db.toggle_subscription(user_id)
+
+
+def get_user_homework_subscription(user_id):
+    return db.get_user_homework_subscription(user_id)
+
+
+def toggle_homework_subscription(user_id):
+    return db.toggle_homework_subscription(user_id)
+
+
+def get_user_reminder_days(user_id):
+    return db.get_user_reminder_days(user_id)
+
+
+def set_user_reminder_days(user_id, days):
+    return db.set_user_reminder_days(user_id, days)
+
+
+def get_user_reminder_time(user_id):
+    return db.get_user_reminder_time(user_id)
+
+
+def set_user_reminder_time(user_id, time_str):
+    return db.set_user_reminder_time(user_id, time_str)
 
 
 def get_subscribed_users():
@@ -307,6 +398,10 @@ def get_whitelist():
     return db.get_whitelist()
 
 
+def remove_from_whitelist(user_id):
+    db.remove_from_whitelist(user_id)
+
+
 def get_pending_links():
     return db.get_pending_links()
 
@@ -319,5 +414,10 @@ def get_today_links():
     return db.get_today_links()
 
 
+def save_link(par_name, link):
+    return db.save_link(par_name, link)
+
+
 def add_log(user_id, action, level, message):
     db.add_log(user_id, action, level, message)
+
