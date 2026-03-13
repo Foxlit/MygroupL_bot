@@ -131,6 +131,43 @@ USER_STATES = {
 }
 
 
+async def back_to_tasks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Возврат к списку заданий"""
+    query = update.callback_query
+    user_id = update.effective_user.id
+
+    # Получаем сохранённую страницу
+    current_page = context.user_data.get('current_page', 0)
+
+    has_updates = check_for_updates(context, user_id)
+    homework_data = context.user_data.get('homework_data', [])
+
+    if homework_data:
+        set_user_state(user_id, 'TASKS_LIST', page=current_page)
+        message, keyboard = format_homework_page(
+            homework_data,
+            current_page,
+            show_update_notice=has_updates,
+            current_filter=None,
+            context=context
+        )
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            message,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+            disable_web_page_preview=True
+        )
+    else:
+        await query.edit_message_text(
+            f"📭 Данные не загружены. {MESSAGES['hw']}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📚 Загрузить задания", callback_data="show_hw")
+            ]])
+        )
+
+
 async def safe_edit_message(query, text, reply_markup=None, parse_mode="HTML"):
     """Безопасно редактирует сообщение, игнорируя ошибку 'Message is not modified'"""
     try:
@@ -578,9 +615,14 @@ def check_for_updates(context, user_id):
 
 
 def format_homework_page(records, page=0, show_update_notice=False, current_filter=None, context=None):
-    """Форматирует одну страницу с заданиями и плашкой НОВОЕ"""
+    """Форматирует одну страницу с заданиями"""
     if not records:
-        return "📭 В таблице нет заданий, обратитесь к администратору! (Или просто отдохните ;) )", []
+        # Возвращаем сообщение и кнопки навигации
+        keyboard = [
+            [InlineKeyboardButton("🔄 Обновить", callback_data="refresh_data")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
+        ]
+        return "📭 В таблице нет заданий, обратитесь к Администратору! (или просто отдохните ;) )", keyboard
 
     def get_date(item):
         date_str = item.get('Срок')
@@ -702,7 +744,7 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
         filter_buttons.append(InlineKeyboardButton("📅 Сегодня", callback_data="filter_today"))
 
     if current_filter:
-        filter_buttons.append(InlineKeyboardButton("◀️ К списку", callback_data="back_to_tasks"))
+        filter_buttons.append(InlineKeyboardButton("◀️ Назад к заданиям", callback_data="back_to_tasks"))
 
     if filter_buttons:
         for i in range(0, len(filter_buttons), 2):
@@ -823,12 +865,17 @@ async def cleanup_old_links_job(context: ContextTypes.DEFAULT_TYPE):
 
 # ========== НАПОМИНАНИЯ О ДЗ ==========
 async def check_homework_reminders_job(context: ContextTypes.DEFAULT_TYPE):
-    """Проверяет домашние задания и отправляет напоминания"""
-    logger.info("📚 Проверяю напоминания о ДЗ...")
+    """Отправляет напоминания о ДЗ (запускается по расписанию)"""
+    # Получаем текущее московское время
+    moscow_now = get_moscow_time()
+    current_time_str = moscow_now.strftime("%H:%M")
 
+    logger.info(f"📚 Запуск напоминаний о ДЗ в {current_time_str} МСК")
+
+    # Получаем данные из кэша
     homework_data = _data_cache.get('data', [])
     if not homework_data:
-        logger.info("📭 Нет данных о ДЗ")
+        logger.info("📭 Нет данных о ДЗ в кэше")
         return
 
     today = datetime.now().date()
@@ -844,84 +891,136 @@ async def check_homework_reminders_job(context: ContextTypes.DEFAULT_TYPE):
             due_date = datetime.strptime(due_date_str, "%d.%m.%Y").date()
             days_left = (due_date - today).days
 
-            if days_left < 0:
+            if days_left < 0:  # Просроченные не напоминаем
                 continue
 
-            subject = hw.get('Предмет')
-            task_data = hw.get('Задание')
-            task_text = task_data.get('text') if isinstance(task_data, dict) else str(task_data)
+            subject = hw.get('Предмет', 'Без предмета')
+            task_data = hw.get('Задание', {})
+
+            # Форматируем задание с поддержкой гиперссылок
+            if isinstance(task_data, dict) and task_data.get('is_hyperlink'):
+                task_text = f'<a href="{task_data["url"]}">{task_data["text"]}</a>'
+            else:
+                task_text = str(task_data)
+                if task_text.startswith(('http://', 'https://')):
+                    task_text = f'<a href="{task_text}">🔗 ссылка</a>'
+
+            # Статус эмодзи в зависимости от дней
+            if days_left == 0:
+                status = "🔥 СЕГОДНЯ!"
+            elif days_left == 1:
+                status = "⚠️ ЗАВТРА!"
+            elif days_left <= 3:
+                status = f"⏰ {days_left} дн."
+            else:
+                status = f"⏳ {days_left} дн."
 
             if days_left not in reminders_by_days:
                 reminders_by_days[days_left] = []
             reminders_by_days[days_left].append({
                 'subject': subject,
-                'task': task_text[:50] + '...' if len(task_text) > 50 else task_text,
-                'due_date': due_date_str
+                'task': task_text,
+                'due_date': due_date_str,
+                'status': status,
+                'days_left': days_left
             })
 
         except Exception as e:
-            logger.error(f"Ошибка парсинга даты {due_date_str}: {e}")
+            logger.error(f"❌ Ошибка парсинга даты '{due_date_str}': {e}")
 
     if not reminders_by_days:
-        logger.info("📭 Нет заданий для напоминаний")
+        logger.info("📭 Нет заданий, подходящих для напоминаний")
         return
 
-    # Получаем всех пользователей
+    # Получаем всех авторизованных пользователей
     all_users = db.get_authorized_users()
     sent_count = 0
 
     for user_id in all_users:
-        if not db.get_user_homework_subscription(user_id):
-            continue
+        try:
+            # Проверяем подписку на ДЗ
+            if not db.get_user_homework_subscription(user_id):
+                logger.debug(f"⏭️ Пользователь {user_id} не подписан на ДЗ")
+                continue
 
-        reminder_days = db.get_user_reminder_days(user_id)
-        user_reminders = []
+            # Получаем время пользователя
+            user_time = db.get_user_reminder_time(user_id)
 
-        for days_left in reminder_days:
-            if days_left in reminders_by_days:
-                for hw in reminders_by_days[days_left]:
-                    user_reminders.append({
-                        'days_left': days_left,
-                        'subject': hw['subject'],
-                        'task': hw['task']
-                    })
+            # ⚠️ КЛЮЧЕВОЕ: отправляем ТОЛЬКО если время совпадает
+            if user_time != current_time_str:
+                logger.debug(f"⏭️ Пользователь {user_id} ждёт {user_time}, сейчас {current_time_str}")
+                continue
 
-        if user_reminders:
+            # Получаем настройки дней для этого пользователя
+            reminder_days = db.get_user_reminder_days(user_id)
+            logger.debug(f"👤 Пользователь {user_id} - время {user_time}, дни {reminder_days}")
+
+            # Собираем напоминания для этого пользователя
+            user_reminders = []
+            for days_left in reminder_days:
+                if days_left in reminders_by_days:
+                    for hw in reminders_by_days[days_left]:
+                        user_reminders.append({
+                            'days_left': days_left,
+                            'subject': hw['subject'],
+                            'task': hw['task'],
+                            'status': hw['status'],
+                            'due_date': hw['due_date']
+                        })
+
+            if not user_reminders:
+                logger.debug(f"⏭️ У пользователя {user_id} нет заданий под его дни")
+                continue
+
+            # Сортируем по количеству дней
+            user_reminders.sort(key=lambda x: x['days_left'])
+
+            # Формируем сообщение
             if len(user_reminders) == 1:
                 r = user_reminders[0]
                 message = (
                     f"📚 <b>Напоминание о ДЗ</b>\n\n"
                     f"<b>{r['subject']}</b>\n"
                     f"📌 {r['task']}\n"
-                    f"⏳ Осталось {r['days_left']} дн."
+                    f"📅 Срок: {r['due_date']} {r['status']}"
                 )
             else:
                 message = "📚 <b>Напоминания о ДЗ</b>\n\n"
-                for r in sorted(user_reminders, key=lambda x: x['days_left']):
-                    message += f"• <b>{r['subject']}</b> — {r['days_left']} дн.\n"
+                for r in user_reminders:
+                    message += f"• <b>{r['subject']}</b> — {r['status']}\n"
+                    message += f"  {r['task']}\n\n"
 
-            try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=message,
-                    parse_mode="HTML"
-                )
-                sent_count += 1
-                await asyncio.sleep(0.05)
-            except Exception as e:
-                logger.error(f"❌ Ошибка отправки пользователю {user_id}: {e}")
+            # Отправляем сообщение
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=message,
+                parse_mode="HTML"
+            )
+            sent_count += 1
+            logger.debug(f"✅ Отправлено пользователю {user_id}")
+            await asyncio.sleep(0.05)
 
-    logger.info(f"✅ Напоминания отправлены {sent_count} пользователям")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при обработке пользователя {user_id}: {e}")
+
+    logger.info(f"✅ Напоминания отправлены {sent_count} пользователям в {current_time_str}")
 
 
 # ========== КОМАНДА ДЛЯ ПРОСМОТРА ССЫЛОК ==========
 @authorized_only
 async def links_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает сегодняшние ссылки с кнопками навигации"""
+    """Показывает сегодняшние ссылки с обратной связью"""
     user = update.effective_user
     username = user.username or user.first_name
+    user_id = user.id
 
-    logger.info(f"👤 Пользователь @{username} запросил ссылки (/links)")
+    logger.info(f"👤 Пользователь @{username} {user_id} запросил ссылки (/links)")
+
+    # Показываем "печатает..."
+    await update.message.chat.send_action(action="typing")
+
+    # Отправляем сообщение о начале загрузки
+    loading_msg = await update.message.reply_text("🔍 Загружаю список ссылок...")
 
     try:
         today_links = get_today_links()
@@ -929,13 +1028,12 @@ async def links_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if today_links:
             message = "🔗 <b>Сегодняшние ссылки:</b>\n\n"
             for w in today_links:
-                status = "✅ Отправлено" if w['notified'] else "⏳ Ожидает"
                 message += f"<b>{w['par_name']}</b>\n"
                 message += f"  🔗 {w['link']}\n"
         else:
             message = "📭 На сегодня ссылок нет"
 
-        # Добавляем кнопки навигации
+        # Кнопки навигации
         keyboard = [
             [InlineKeyboardButton("📚 Задания", callback_data="show_hw")],
             [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
@@ -943,6 +1041,10 @@ async def links_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
+        # Удаляем сообщение о загрузке
+        await loading_msg.delete()
+
+        # Отправляем результат
         await update.message.reply_text(
             message,
             parse_mode="HTML",
@@ -952,7 +1054,8 @@ async def links_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"❌ Ошибка в links_command: {e}")
-        await update.message.reply_text("❌ Не удалось получить список ссылок")
+        # В случае ошибки заменяем сообщение
+        await loading_msg.edit_text("❌ Не удалось получить список ссылок")
 
 
 # ========== НАСТРОЙКИ ==========
@@ -1726,6 +1829,68 @@ async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
 
+@authorized_only
+@authorized_only
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для быстрого перехода к настройкам (/settings)"""
+    user = update.effective_user
+    username = user.username or user.first_name
+    user_id = user.id
+
+    logger.info(f"👤 Пользователь @{username} вызвал команду /settings")
+
+    # Показываем "печатает..."
+    await update.message.chat.send_action(action="typing")
+
+    # Получаем статусы подписок
+    links_sub = get_user_subscription(user_id)
+    hw_sub = db.get_user_homework_subscription(user_id)
+    reminder_days = db.get_user_reminder_days(user_id)
+    reminder_time = db.get_user_reminder_time(user_id)
+
+    links_status = "✅ Включена" if links_sub else "❌ Отключена"
+    hw_status = "✅ Включена" if hw_sub else "❌ Отключена"
+    days_str = ', '.join(str(d) for d in sorted(reminder_days))
+
+    message = (
+        "⚙️ <b>Настройки</b>\n\n"
+        f"👤 Ваш ID: <code>{user_id}</code>\n\n"
+        f"<b>Рассылки:</b>\n"
+        f"🔗 Ссылки на вебинары: {links_status}\n"
+        f"📚 Напоминания о ДЗ: {hw_status}\n"
+        f"⏰ Время напоминаний: {reminder_time} МСК\n"
+        f"📅 Напоминать за: {days_str} дн.\n\n"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton(f"{'🔕' if links_sub else '🔔'} Ссылки",
+                                 callback_data="toggle_links"),
+        ],
+        [
+            InlineKeyboardButton(f"{'🔕' if hw_sub else '🔔'} ДЗ",
+                                 callback_data="toggle_homework"),
+        ],
+        [InlineKeyboardButton("⏰ Настроить время", callback_data="reminder_time")],
+        [InlineKeyboardButton("📅 Настроить дни", callback_data="reminder_days")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="main_menu")]
+    ]
+
+    if user_id == ADMIN_ID:
+        keyboard.insert(2, [InlineKeyboardButton("👑 Админ панель", callback_data="admin_panel")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        message,
+        parse_mode="HTML",
+        reply_markup=reply_markup,
+        disable_web_page_preview=True
+    )
+
+    set_user_state(user_id, 'SETTINGS')
+
+
 # Сокращённые команды
 @admin_only
 async def adduser_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2064,6 +2229,7 @@ async def homework_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"👤 Пользователь @{username} (ID: {user_id}) вызвал команду /hw")
 
+    # Проверка на спам
     current_time = time.time()
     if user_id in user_last_request:
         time_diff = current_time - user_last_request[user_id]
@@ -2075,7 +2241,11 @@ async def homework_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_last_request[user_id] = current_time
 
+    # Показываем "печатает..."
     await update.message.chat.send_action(action="typing")
+
+    # Отправляем сообщение о начале загрузки
+    loading_msg = await update.message.reply_text("🔍 Загружаю данные из таблицы...")
 
     try:
         homework_data = get_homework_fast(force_refresh=True)
@@ -2090,6 +2260,10 @@ async def homework_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             reply_markup = InlineKeyboardMarkup(keyboard)
 
+            # Удаляем сообщение о загрузке
+            await loading_msg.delete()
+
+            # Отправляем результат
             await update.message.reply_text(
                 message,
                 parse_mode="HTML",
@@ -2112,12 +2286,14 @@ async def homework_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['data_version'] = _data_cache.get('version', 0)
             context.user_data['seen_records'] = seen_records
         else:
-            await update.message.reply_text("📭 В таблице нет заданий, обратитесь к администратору! "
-                                            "(Или просто отдохните ;) )")
+            # Если данных нет, заменяем сообщение о загрузке
+            await loading_msg.edit_text("📭 В таблице нет заданий, обратитесь к Администратору! "
+                                        "(или просто отдохните ;) )")
 
     except Exception as e:
         logger.error(f"❌ Ошибка в /hw: {e}")
-        await update.message.reply_text(f"⚠️ Временно недоступно. {MESSAGES['start']}")
+        # В случае ошибки тоже заменяем сообщение
+        await loading_msg.edit_text(f"⚠️ Временно недоступно. {MESSAGES['start']}")
 
 
 # ========== ОБРАБОТЧИК КНОПОК ==========
@@ -2529,9 +2705,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif data == "back_to_tasks":
             logger.info(f"◀️ Пользователь {username} вернулся к заданиям")
+
             has_updates = check_for_updates(context, user_id)
             homework_data = context.user_data.get('homework_data', [])
             current_page = context.user_data.get('current_page', 0)
+
             if homework_data:
                 set_user_state(user_id, 'TASKS_LIST', page=current_page)
                 message, keyboard = format_homework_page(
@@ -2542,10 +2720,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context=context
                 )
                 reply_markup = InlineKeyboardMarkup(keyboard)
+
                 await query.edit_message_text(
                     message,
                     parse_mode="HTML",
                     reply_markup=reply_markup,
+
                     disable_web_page_preview=True
                 )
             else:
@@ -2677,7 +2857,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 message = "📭 На сегодня заданий нет!"
-                keyboard = [[InlineKeyboardButton("◀️ К списку", callback_data="back_to_tasks")]]
+                keyboard = [[InlineKeyboardButton("◀️ Назад к заданиям", callback_data="back_to_tasks")]]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 await query.edit_message_text(
                     message,
@@ -2855,31 +3035,45 @@ def main():
 
     # Очистка старых ссылок в 19:00 и 20:30 МСК
     try:
-        # В 19:00 (после первой пары)
+        # Очистка в 19:00
         job_queue.run_daily(
             cleanup_old_links_job,
             time=dt_time(19, 0, 0, tzinfo=MOSCOW_TZ),
             days=tuple(range(7))
         )
-        # В 20:30 (после второй пары)
+        logger.info("✅ Автоочистка запланирована на 19:00 МСК")
+
+        # Очистка в 20:30
         job_queue.run_daily(
             cleanup_old_links_job,
             time=dt_time(20, 30, 0, tzinfo=MOSCOW_TZ),
             days=tuple(range(7))
         )
-        logger.info("✅ Автоочистка ссылок запланирована на 19:00 и 20:30 МСК")
+        logger.info("✅ Автоочистка запланирована на 20:30 МСК")
     except Exception as e:
         logger.error(f"⚠️ Ошибка при планировании очистки: {e}")
 
-    # Напоминания о ДЗ (проверка каждый час)
-    job_queue.run_repeating(check_homework_reminders_job, interval=3600, first=60)
-    logger.info("✅ Напоминания о ДЗ запущены (проверка каждый час)")
+    # Напоминания о ДЗ - строго по расписанию
+    reminder_times = ["09:00", "12:00", "15:00", "18:00", "21:00"]
+
+    for time_str in reminder_times:
+        hour, minute = map(int, time_str.split(':'))
+        try:
+            job_queue.run_daily(
+                check_homework_reminders_job,
+                time=dt_time(hour, minute, 0, tzinfo=MOSCOW_TZ),
+                days=tuple(range(7))  # Каждый день
+            )
+            logger.info(f"✅ Напоминания о ДЗ запланированы на {time_str} МСК")
+        except Exception as e:
+            logger.error(f"⚠️ Ошибка при планировании напоминаний на {time_str}: {e}")
 
     # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("hw", homework_command))
     app.add_handler(CommandHandler("links", links_command))
+    app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("ra", request_access_command))
 
     # Админ-команды
