@@ -133,5 +133,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("🛑 Получен сигнал завершения")
         backup_thread_running = False
-        global backup_thread_running
         save_database("Manual shutdown")
