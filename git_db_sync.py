@@ -21,9 +21,12 @@ class GitDatabaseSync:
     def clone_repo(self):
         """Клонирует репозиторий во временную папку"""
         self.temp_dir = tempfile.mkdtemp()
-        repo_url = f"https://{os.environ['GITHUB_TOKEN']}@github.com/{os.environ['GITHUB_REPO']}.git"
 
-        logger.info(f"📥 Клонирую репозиторий в {self.temp_dir}")
+        # Очищаем название репозитория
+        repo_name = os.environ['GITHUB_REPO'].rstrip('/').rstrip('.git')
+        repo_url = f"https://{os.environ['GITHUB_TOKEN']}@github.com/{repo_name}.git"
+
+        logger.info(f"📥 Клонирую репозиторий {repo_name} в {self.temp_dir}")
         self.repo = Repo.clone_from(repo_url, self.temp_dir, branch=self.branch)
         return self.temp_dir
 
@@ -34,6 +37,8 @@ class GitDatabaseSync:
             github_db = Path(temp_path) / "shared-data" / "bot_data.db"
 
             if github_db.exists():
+                # Создаём папку назначения, если её нет
+                self.db_path.parent.mkdir(exist_ok=True)
                 # Копируем БД из GitHub в рабочую папку
                 shutil.copy2(github_db, self.db_path)
                 logger.info(f"✅ База данных загружена из GitHub: {github_db}")
@@ -52,17 +57,24 @@ class GitDatabaseSync:
             if not self.repo:
                 self.clone_repo()
 
+            # Создаём папку shared-data в репозитории, если её нет
+            repo_db_dir = Path(self.temp_dir) / "shared-data"
+            repo_db_dir.mkdir(exist_ok=True)
+
             # Копируем БД в репозиторий
-            repo_db = Path(self.temp_dir) / "shared-data" / "bot_data.db"
-            repo_db.parent.mkdir(exist_ok=True)
+            repo_db = repo_db_dir / "bot_data.db"
             shutil.copy2(self.db_path, repo_db)
 
-            # Коммитим и пушим
+            # Проверяем, есть ли изменения
             self.repo.index.add([str(repo_db.relative_to(self.temp_dir))])
-            self.repo.index.commit(commit_message)
-            self.repo.remote().push()
 
-            logger.info(f"✅ База данных загружена в GitHub: {commit_message}")
+            if self.repo.index.diff("HEAD") or self.repo.untracked_files:
+                self.repo.index.commit(commit_message)
+                self.repo.remote().push()
+                logger.info(f"✅ База данных загружена в GitHub: {commit_message}")
+            else:
+                logger.info("📭 Нет изменений в базе данных")
+
             return True
 
         except Exception as e:
