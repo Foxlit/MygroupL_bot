@@ -2897,7 +2897,7 @@ async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT
 
     message_text = update.message.text
 
-    allowed_tags = ['b', 'i', 'u', 's', 'a', 'code', 'pre', 'tg-spoiler']
+    allowed_tags = ['b', 'i', 'u', 's', 'a', 'code', 'pre', 'tg', 'tg-spoiler']
 
     import re
     forbidden_tags = re.findall(r'<(\w+)[^>]*>', message_text)
