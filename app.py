@@ -2,21 +2,33 @@ import os
 import sys
 import asyncio
 import threading
-from flask import Flask
+from flask import Flask, make_response
 
 # Создаём Flask приложение
 app = Flask(__name__)
 
 
 @app.route('/')
+def home():
+    return "Bot is running!", 200
+
+
 @app.route('/health')
+@app.route('/ping')  # добавим ещё один эндпоинт для надёжности
 def health():
-    return "OK", 200
+    # Максимально простой ответ, только текст
+    response = make_response("OK", 200)
+    response.headers['Content-Type'] = 'text/plain'
+    return response
 
 
 def run_flask():
     """Запускает Flask сервер в отдельном потоке"""
     port = int(os.environ.get('PORT', 10000))
+    # Отключаем лишние логи
+    import logging
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
     app.run(host='0.0.0.0', port=port, threaded=True)
 
 
@@ -55,7 +67,7 @@ if __name__ == "__main__":
 
     time.sleep(2)
 
-    # Запускаем бота в главном потоке (здесь можно работать с сигналами)
+    # Запускаем бота в главном потоке
     print("🚀 Запуск бота в главном потоке...")
 
     try:
