@@ -14,9 +14,8 @@ def home():
 
 
 @app.route('/health')
-@app.route('/ping')  # добавим ещё один эндпоинт для надёжности
+@app.route('/ping')
 def health():
-    # Максимально простой ответ, только текст
     response = make_response("OK", 200)
     response.headers['Content-Type'] = 'text/plain'
     return response
@@ -25,7 +24,6 @@ def health():
 def run_flask():
     """Запускает Flask сервер в отдельном потоке"""
     port = int(os.environ.get('PORT', 10000))
-    # Отключаем лишние логи
     import logging
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
@@ -53,6 +51,23 @@ def init_database():
     return True
 
 
+def run_bot():
+    """Запускает бота с собственным event loop в главном потоке"""
+    # Создаём event loop для главного потока
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        from bot import main as bot_main
+        bot_main()
+    except Exception as e:
+        print(f"❌ Ошибка в боте: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        loop.close()
+
+
 if __name__ == "__main__":
     # Сначала создаём БД
     if not init_database():
@@ -67,15 +82,6 @@ if __name__ == "__main__":
 
     time.sleep(2)
 
-    # Запускаем бота в главном потоке
+    # Запускаем бота в главном потоке с явным event loop
     print("🚀 Запуск бота в главном потоке...")
-
-    try:
-        from bot import main as bot_main
-
-        bot_main()
-    except Exception as e:
-        print(f"❌ Ошибка в боте: {e}")
-        import traceback
-
-        traceback.print_exc()
+    run_bot()
