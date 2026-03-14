@@ -1673,7 +1673,7 @@ async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 @admin_only
 async def whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для просмотра белого списка"""
+    """Команда для просмотра белого списка с кнопками навигации"""
     whitelist = get_whitelist()
 
     if not whitelist:
@@ -1700,9 +1700,16 @@ async def whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📅 Добавлен: {added_at}\n\n"
         )
 
+    # Добавляем кнопки навигации
+    keyboard = [
+        [InlineKeyboardButton("👑 Админ панель", callback_data="admin_panel")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     try:
         if len(message) > 4000:
-            message = "📋 <b>Белый список</b>\n\n"
+            message = "📋 <b>Белый список:</b>\n\n"
             for item in whitelist[:]:
                 with db._get_connection() as conn:
                     cursor = conn.cursor()
@@ -1714,70 +1721,54 @@ async def whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 comment = item['comment'] or 'без комментария'
                 message += f"• <code>{item['user_id']}</code> {username} - {comment}\n"
                 message += f"  🕐 {added_at}\n\n"
-            await update.message.reply_text(message, parse_mode="HTML")
+            await update.message.reply_text(message, parse_mode="HTML", reply_markup=reply_markup)
         else:
-            await update.message.reply_text(message, parse_mode="HTML")
+            await update.message.reply_text(message, parse_mode="HTML", reply_markup=reply_markup)
     except Exception as e:
         logger.error(f"❌ Ошибка при отправке списка: {e}")
         await update.message.reply_text(
-            "❌ Произошла ошибка при отправке списка.\n"
-            f"Детали: {e}"
+            f"❌ Произошла ошибка при отправке списка.\nДетали: {e}"
         )
 
 
 @admin_only
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для массовой рассылки"""
-    try:
-        args = context.args
-        if len(args) < 1:
-            await update.message.reply_text(
-                "❌ Использование: /broadcast <текст сообщения>\n"
-                "Пример: /broadcast 📢 Важное объявление!"
+    """Команда для создания рассылки (перенаправляет в меню)"""
+    user = update.effective_user
+    username = user.username or user.first_name
+    user_id = user.id
+
+    logger.info(f"👑 Админ @{username} вызвал команду /broadcast")
+
+    # Создаём мок-объект callback_query для вызова admin_broadcast
+    class MockQuery:
+        def __init__(self, user_id):
+            self.data = "admin_broadcast"
+            self.from_user = type('User', (), {'id': user_id})()
+            self.message = type('Message', (), {
+                'chat_id': update.message.chat_id,
+                'message_id': None
+            })()
+
+        async def answer(self):
+            pass
+
+        async def edit_message_text(self, text, parse_mode=None, reply_markup=None, disable_web_page_preview=None):
+            # Вместо редактирования отправляем новое сообщение
+            return await update.message.reply_text(
+                text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+                disable_web_page_preview=disable_web_page_preview
             )
-            return
 
-        message_text = " ".join(args)
+    # Создаём мок и вызываем обработчик
+    mock_query = MockQuery(user_id)
+    update.callback_query = mock_query
 
-        status_msg = await update.message.reply_text("📨 Начинаю рассылку...")
-
-        users = db.get_authorized_users()
-
-        if not users:
-            await status_msg.edit_text("📭 Нет авторизованных пользователей для рассылки.")
-            return
-
-        success_count = 0
-        fail_count = 0
-
-        for user_id in users:
-            try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"📢 <b>Рассылка</b>\n\n{message_text}",
-                    parse_mode="HTML"
-                )
-                success_count += 1
-                await asyncio.sleep(0.05)
-            except Exception as e:
-                logger.error(f"❌ Ошибка отправки пользователю {user_id}: {e}")
-                fail_count += 1
-
-        result_message = (
-            f"✅ Рассылка завершена!\n\n"
-            f"📊 Статистика:\n"
-            f"• Успешно: {success_count}\n"
-            f"• Ошибок: {fail_count}\n"
-            f"• Всего: {len(users)}"
-        )
-        await status_msg.edit_text(result_message)
-
-        add_log(update.effective_user.id, "admin", "INFO",
-                f"Сделал рассылку: {success_count}/{len(users)} успешно")
-
-    except Exception as e:
-        logger.error(f"❌ Ошибка в broadcast_command: {e}")
-        await update.message.reply_text(f"❌ Ошибка при рассылке: {e}")
+    # Вызываем существующий обработчик admin_broadcast
+    from bot import button_handler
+    await button_handler(update, context)
 
 
 @admin_only
