@@ -19,20 +19,98 @@ class Database:
 
     def __init__(self, db_path=None):
         self.db_path = db_path or DB_PATH
-        # НЕ вызываем _ensure_db_exists здесь!
-        # База данных будет создана через init_db.py
+        # НЕ вызываем проверку в конструкторе!
+        self._db_checked = False
 
     def _ensure_db_exists(self):
-        """Проверяет существование БД"""
+        """Проверяет существование БД и создаёт при необходимости"""
+        if self._db_checked:
+            return True
+
         if not self.db_path.exists():
-            # Не вызываем ошибку, просто возвращаем False
-            return False
+            # Пытаемся создать папку
+            self.db_path.parent.mkdir(exist_ok=True)
+
+            # Создаём пустую БД с таблицами
+            self._create_empty_db()
+
+        self._db_checked = True
         return True
+
+    def _create_empty_db(self):
+        """Создаёт пустую БД с таблицами"""
+        try:
+            conn = sqlite3.connect(str(self.db_path))
+            cursor = conn.cursor()
+
+            # Таблица пользователей
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    is_authorized BOOLEAN DEFAULT 0,
+                    subscribed_links BOOLEAN DEFAULT 1,
+                    subscribed_homework BOOLEAN DEFAULT 1,
+                    homework_reminder_days TEXT DEFAULT '0,1,2,3,7',
+                    homework_reminder_time TEXT DEFAULT '12:00',
+                    auth_date TIMESTAMP,
+                    last_active TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Таблица белого списка
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS whitelist (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER UNIQUE,
+                    added_by INTEGER,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    comment TEXT
+                )
+            """)
+
+            # Таблица ссылок
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS links (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    par_name TEXT NOT NULL,
+                    link TEXT NOT NULL,
+                    parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    notified BOOLEAN DEFAULT 0,
+                    expires_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_links_notified 
+                ON links(notified, parsed_at)
+            """)
+
+            # Таблица логов
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    action TEXT,
+                    level TEXT,
+                    message TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            conn.commit()
+            conn.close()
+            print(f"✅ Создана новая база данных: {self.db_path}")
+        except Exception as e:
+            print(f"❌ Ошибка при создании БД: {e}")
+            raise
 
     def _get_connection(self):
         """Возвращает подключение к БД"""
-        if not self._ensure_db_exists():
-            raise FileNotFoundError(f"База данных не найдена: {self.db_path}")
+        self._ensure_db_exists()
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
         return conn
