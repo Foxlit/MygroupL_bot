@@ -22,13 +22,20 @@ class GitDatabaseSync:
         """Клонирует репозиторий во временную папку"""
         self.temp_dir = tempfile.mkdtemp()
 
-        # Отладка: выводим значение переменной
-        repo_name_raw = os.environ.get('GITHUB_REPO', 'НЕ ЗАДАНО')
+        # Получаем название репозитория
+        repo_name_raw = os.environ.get('GITHUB_REPO', '')
         print(f"🔍 GITHUB_REPO из окружения: '{repo_name_raw}'")
 
-        # Очищаем название репозитория
-        repo_name = repo_name_raw.rstrip('/').rstrip('.git')
-        print(f"🔍 Очищенное название: '{repo_name}'")
+        # Убираем лишние пробелы
+        repo_name_raw = repo_name_raw.strip()
+
+        # Если в конце есть .git, убираем его
+        if repo_name_raw.endswith('.git'):
+            repo_name = repo_name_raw[:-4]
+        else:
+            repo_name = repo_name_raw
+
+        print(f"🔍 После обработки: '{repo_name}'")
 
         repo_url = f"https://{os.environ['GITHUB_TOKEN']}@github.com/{repo_name}.git"
         print(f"🔍 URL для клонирования: {repo_url.replace(os.environ['GITHUB_TOKEN'], '*****')}")
