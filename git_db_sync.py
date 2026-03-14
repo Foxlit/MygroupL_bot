@@ -45,8 +45,9 @@ class GitDatabaseSync:
         return self.temp_dir
 
     def download_db(self):
-        """Скачивает базу данных из GitHub"""
+        """Скачивает базу данных из GitHub (всегда свежую)"""
         try:
+            # Всегда клонируем свежую копию
             temp_path = self.clone_repo()
             github_db = Path(temp_path) / "shared-data" / "bot_data.db"
 
@@ -55,7 +56,7 @@ class GitDatabaseSync:
                 self.db_path.parent.mkdir(exist_ok=True)
                 # Копируем БД из GitHub в рабочую папку
                 shutil.copy2(github_db, self.db_path)
-                logger.info(f"✅ База данных загружена из GitHub: {github_db}")
+                logger.info(f"✅ База данных загружена из GitHub (актуальная версия)")
                 return True
             else:
                 logger.warning("⚠️ База данных не найдена в GitHub, будет создана новая")

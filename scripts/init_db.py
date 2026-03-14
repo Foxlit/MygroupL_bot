@@ -142,10 +142,8 @@ def create_db_module(db_dir):
 """
 
 import sqlite3
-import os
-from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 # Определяем путь к БД
 DB_PATH = Path(__file__).parent / "shared-data" / "bot_data.db"

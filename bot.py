@@ -18,6 +18,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 # Импорт базы данных
+from app import db_sync
 from database import (
     db, add_user, is_authorized, authorize_user, is_in_whitelist,
     get_user_subscription, toggle_subscription, get_subscribed_users,
@@ -139,7 +140,7 @@ async def back_to_tasks_handler(update: Update, context: ContextTypes.DEFAULT_TY
     # Получаем сохранённую страницу
     current_page = context.user_data.get('current_page', 0)
 
-    has_updates = check_for_updates(context, user_id)
+    has_updates = check_for_updates(context)
     homework_data = context.user_data.get('homework_data', [])
 
     if homework_data:
@@ -557,7 +558,7 @@ def background_cache_updater():
 
 # ========== ФУНКЦИИ ФОРМАТИРОВАНИЯ ==========
 
-def check_for_updates(context, user_id):
+def check_for_updates(context):
     """Проверяет, есть ли реальные изменения в данных для пользователя"""
     current_data = _data_cache.get('data', [])
     previous_data = _data_cache.get('previous_data', [])
@@ -629,8 +630,8 @@ def format_homework_page(records, page=0, show_update_notice=False, current_filt
         if date_str:
             try:
                 return datetime.strptime(date_str, "%d.%m.%Y")
-            except Exception as e:
-                logger.debug(f"Ошибка парсинга даты: {e}")
+            except Exception as E:
+                logger.debug(f"Ошибка парсинга даты: {E}")
                 pass
         return datetime.max
 
@@ -805,7 +806,7 @@ async def check_links_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ========== ОЧИСТКА СТАРЫХ ССЫЛОК ==========
-async def cleanup_old_links_job(context: ContextTypes.DEFAULT_TYPE):
+async def cleanup_old_links_job():
     """Автоматически удаляет ссылки на прошедшие пары"""
     moscow_now = get_moscow_time()
     current_hour = moscow_now.hour
@@ -894,8 +895,8 @@ async def check_homework_reminders_job(context: ContextTypes.DEFAULT_TYPE):
             if days_left < 0:  # Просроченные не напоминаем
                 continue
 
-            subject = hw.get('Предмет', 'Без предмета')
-            task_data = hw.get('Задание', {})
+            subject = hw.get('Предмет')
+            task_data = hw.get('Задание')
 
             # Форматируем задание с поддержкой гиперссылок
             if isinstance(task_data, dict) and task_data.get('is_hyperlink'):
@@ -946,7 +947,6 @@ async def check_homework_reminders_job(context: ContextTypes.DEFAULT_TYPE):
             # Получаем время пользователя
             user_time = db.get_user_reminder_time(user_id)
 
-            # ⚠️ КЛЮЧЕВОЕ: отправляем ТОЛЬКО если время совпадает
             if user_time != current_time_str:
                 logger.debug(f"⏭️ Пользователь {user_id} ждёт {user_time}, сейчас {current_time_str}")
                 continue
@@ -1011,7 +1011,7 @@ async def check_homework_reminders_job(context: ContextTypes.DEFAULT_TYPE):
 
 # ========== КОМАНДА ДЛЯ ПРОСМОТРА ССЫЛОК ==========
 @authorized_only
-async def links_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def links_command(update: Update):
     """Показывает сегодняшние ссылки с обратной связью"""
     user = update.effective_user
     username = user.username or user.first_name
@@ -1062,7 +1062,7 @@ async def links_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ========== НАСТРОЙКИ ==========
-async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def settings_menu(update: Update):
     """Меню настроек"""
     query = update.callback_query
     user = update.effective_user
@@ -1116,7 +1116,7 @@ async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def toggle_links_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def toggle_links_handler(update: Update):
     """Переключает подписку на ссылки"""
     query = update.callback_query
     user = update.effective_user
@@ -1125,10 +1125,12 @@ async def toggle_links_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
 
     toggle_subscription(user_id)
-    await settings_menu(update, context)
+    await settings_menu(update)
+    if db_sync:
+        db_sync.upload_db(commit_message=f"Settings updated by user {user_id}")
 
 
-async def toggle_homework_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def toggle_homework_handler(update: Update):
     """Переключает подписку на напоминания о ДЗ"""
     query = update.callback_query
     user = update.effective_user
@@ -1137,7 +1139,9 @@ async def toggle_homework_handler(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
 
     db.toggle_homework_subscription(user_id)
-    await settings_menu(update, context)
+    await settings_menu(update)
+    if db_sync:
+        db_sync.upload_db(commit_message=f"Settings updated by user {user_id}")
 
 
 async def reminder_days_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1218,12 +1222,14 @@ async def reminder_days_save_handler(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     user_id = update.effective_user.id
 
-    temp_days = context.user_data.get('temp_reminder_days', [0, 1, 2, 3, 7])
+    temp_days = context.user_data.get('temp_reminder_days', [0, 1, 2, 3, 7, 14])
     db.set_user_reminder_days(user_id, temp_days)
     context.user_data.pop('temp_reminder_days', None)
 
     await query.answer("✅ Настройки сохранены!")
-    await settings_menu(update, context)
+    await settings_menu(update)
+    if db_sync:
+        db_sync.upload_db(commit_message=f"Settings updated by user {user_id}")
 
 
 async def reminder_time_save_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1242,7 +1248,9 @@ async def reminder_time_save_handler(update: Update, context: ContextTypes.DEFAU
         await query.answer(f"⏰ Время не выбрано (текущее: {current})")
 
     context.user_data.pop('temp_reminder_time', None)
-    await settings_menu(update, context)
+    await settings_menu(update)
+    if db_sync:
+        db_sync.upload_db(commit_message=f"Settings updated by user {user_id}")
 
 
 async def reminder_time_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1272,6 +1280,8 @@ async def reminder_time_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Показываем обновлённое меню
     await reminder_time_menu(update, context)
+    if db_sync:
+        db_sync.upload_db(commit_message=f"Settings updated by user {user_id}")
 
 
 async def reminder_time_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1317,13 +1327,14 @@ async def reminder_time_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # Используем безопасное редактирование
     await safe_edit_message(query, message, reply_markup)
+    if db_sync:
+        db_sync.upload_db(commit_message=f"Settings updated by user {user_id}")
 
 
 # ========== АДМИН ПАНЕЛЬ ==========
 @admin_only
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_panel(update: Update):
     """Админ панель"""
     query = update.callback_query
     user_id = update.effective_user.id
@@ -1343,7 +1354,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>/whitelist</code> - список доступа\n"
         "• <code>/adduser &lt;id&gt; [комментарий]</code> - добавить пользователя\n"
         "• <code>/removeuser &lt;id&gt;</code> - удалить пользователя\n"
-        "• <code>/broadcast &lt;текст&gt;</code> - массовая рассылка авторизованным пользователям\n\n"
+        "• /broadcast - массовая рассылка\n\n"
         "<b>Навигация:</b>"
     )
 
@@ -1364,7 +1375,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
-async def admin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_whitelist(update: Update):
     """Просмотр белого списка"""
     query = update.callback_query
     user_id = update.effective_user.id
@@ -1429,7 +1440,7 @@ async def admin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
-async def admin_cleanup_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_cleanup_links(update: Update):
     """Ручная очистка старых ссылок"""
     query = update.callback_query
     user_id = update.effective_user.id
@@ -1449,14 +1460,14 @@ async def admin_cleanup_links(update: Update, context: ContextTypes.DEFAULT_TYPE
         "🧹 <b>Очистка ссылок</b>\n\n"
         "Выберите действие:\n\n"
         "• <b>Удалить прошедшие пары</b> - удалит ссылки на пары, которые уже прошли\n"
-        "• <b>Удалить ВСЕ ссылки</b> - полная очистка (только для экстренных случаев)",
+        "• <b>Удалить ВСЕ ссылки</b> - полная очистка",
         parse_mode="HTML",
         reply_markup=reply_markup
     )
 
 
 @admin_only
-async def cleanup_old_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cleanup_old_handler(update: Update):
     """Удаляет только прошедшие пары"""
     query = update.callback_query
     user_id = update.effective_user.id
@@ -1470,7 +1481,6 @@ async def cleanup_old_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             # Получаем статистику ДО
             cursor.execute("SELECT COUNT(*) as count FROM links")
-            before = cursor.fetchone()['count']
 
             # Определяем текущее время
             moscow_now = get_moscow_time()
@@ -1515,6 +1525,8 @@ async def cleanup_old_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
         add_log(user_id, "admin", "INFO", f"Ручная очистка: удалено {deleted}")
+        if db_sync:
+            db_sync.upload_db(commit_message=f"Settings updated by user {user_id}")
 
     except Exception as e:
         logger.error(f"❌ Ошибка при очистке: {e}")
@@ -1527,10 +1539,9 @@ async def cleanup_old_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 @admin_only
-async def cleanup_all_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cleanup_all_handler(update: Update):
     """Полная очистка всех ссылок"""
     query = update.callback_query
-    user_id = update.effective_user.id
     await query.answer()
 
     # Запрашиваем подтверждение
@@ -1551,7 +1562,7 @@ async def cleanup_all_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 @admin_only
-async def cleanup_all_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cleanup_all_confirm_handler(update: Update):
     """Подтверждение полной очистки"""
     query = update.callback_query
     user_id = update.effective_user.id
@@ -1564,7 +1575,6 @@ async def cleanup_all_confirm_handler(update: Update, context: ContextTypes.DEFA
             cursor = conn.cursor()
 
             cursor.execute("SELECT COUNT(*) as count FROM links")
-            before = cursor.fetchone()['count']
 
             cursor.execute("DELETE FROM links")
             deleted = cursor.rowcount
@@ -1585,6 +1595,8 @@ async def cleanup_all_confirm_handler(update: Update, context: ContextTypes.DEFA
         )
 
         add_log(user_id, "admin", "INFO", f"Полная очистка: удалено {deleted}")
+        if db_sync:
+            db_sync.upload_db(commit_message=f"Settings updated by user {user_id}")
 
     except Exception as e:
         logger.error(f"❌ Ошибка при очистке: {e}")
@@ -1623,6 +1635,8 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Пользователь {user_id} добавлен в белый список!\n"
             f"Комментарий: {comment or 'не указан'}"
         )
+        if db_sync:
+            db_sync.upload_db(commit_message=f"Settings updated by user {user_id}")
 
     except ValueError:
         await update.message.reply_text("❌ Неверный формат ID. ID должен быть числом.")
@@ -1664,6 +1678,8 @@ async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"✅ Пользователь {user_id} удалён из белого списка!\n"
             f"Он больше не имеет доступа к боту."
         )
+        if db_sync:
+            db_sync.upload_db(commit_message=f"Settings updated by user {user_id}")
 
     except ValueError:
         await update.message.reply_text("❌ Неверный формат ID. ID должен быть числом.")
@@ -1672,7 +1688,7 @@ async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 @admin_only
-async def whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def whitelist_command(update: Update):
     """Команда для просмотра белого списка с кнопками навигации"""
     whitelist = get_whitelist()
 
@@ -1771,7 +1787,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
-async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_panel_command(update: Update):
     """Команда для быстрого доступа к админ-панели (/ap и /adminpanel)"""
     user = update.effective_user
     user_id = user.id
@@ -1822,8 +1838,7 @@ async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 @authorized_only
-@authorized_only
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def settings_command(update: Update):
     """Команда для быстрого перехода к настройкам (/settings)"""
     user = update.effective_user
     username = user.username or user.first_name
@@ -2375,13 +2390,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ==== НАСТРОЙКИ ====
         elif data == "settings":
             set_user_state(user_id, 'SETTINGS')
-            await settings_menu(update, context)
+            await settings_menu(update)
 
         elif data == "toggle_links":
-            await toggle_links_handler(update, context)
+            await toggle_links_handler(update)
 
         elif data == "toggle_homework":
-            await toggle_homework_handler(update, context)
+            await toggle_homework_handler(update)
 
         elif data == "reminder_days":
             await reminder_days_menu(update, context)
@@ -2698,7 +2713,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "back_to_tasks":
             logger.info(f"◀️ Пользователь {username} вернулся к заданиям")
 
-            has_updates = check_for_updates(context, user_id)
+            has_updates = check_for_updates(context)
             homework_data = context.user_data.get('homework_data', [])
             current_page = context.user_data.get('current_page', 0)
 
@@ -2790,7 +2805,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             context.user_data['current_page'] = page + 1
             set_user_state(user_id, 'TASKS_LIST', page=page)
-            has_updates = check_for_updates(context, user_id)
+            has_updates = check_for_updates(context)
             message, keyboard = format_homework_page(
                 homework_data,
                 page,
@@ -2883,7 +2898,6 @@ async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT
     if user_id != ADMIN_ID or not context.user_data.get('awaiting_broadcast'):
         return
 
-    step = context.user_data.get('broadcast_step')
     message_text = update.message.text
 
     allowed_tags = ['b', 'i', 'u', 's', 'a', 'code', 'pre', 'tg-spoiler', 'tg']

@@ -1,5 +1,4 @@
 import os
-import sys
 import asyncio
 import threading
 import time
@@ -12,6 +11,7 @@ app = Flask(__name__)
 
 # Глобальный объект для синхронизации
 db_sync = None
+backup_thread_running = False
 
 
 @app.route('/')
@@ -25,6 +25,22 @@ def health():
     response = make_response("OK", 200)
     response.headers['Content-Type'] = 'text/plain'
     return response
+
+
+def scheduled_backup():
+    """Автоматическое сохранение БД каждые 5 минут"""
+    global backup_thread_running
+    backup_thread_running = True
+
+    while backup_thread_running:
+        time.sleep(300)  # 5 минут
+        if db_sync:
+            print(f"⏰ Автосохранение базы данных в {time.strftime('%H:%M')}")
+            try:
+                db_sync.upload_db(commit_message=f"Auto-backup {time.strftime('%Y-%m-%d %H:%M')}")
+                print("✅ Автосохранение выполнено")
+            except Exception as e:
+                print(f"❌ Ошибка автосохранения: {e}")
 
 
 def run_flask():
@@ -61,17 +77,18 @@ def init_database():
         branch='data'
     )
 
-    # Скачиваем базу
+    # Всегда скачиваем свежую версию
     return db_sync.download_db()
 
 
-def save_database():
+def save_database(commit_message=None):
     """Сохраняет базу данных в GitHub"""
     global db_sync
     if db_sync:
-        print("💾 Сохраняю базу данных в GitHub...")
-        db_sync.upload_db()
-        db_sync.cleanup()
+        if not commit_message:
+            commit_message = f"Database update at {time.strftime('%Y-%m-%d %H:%M')}"
+        print(f"💾 Сохраняю базу данных в GitHub...")
+        db_sync.upload_db(commit_message=commit_message)
 
 
 def run_bot():
@@ -90,13 +107,19 @@ def run_bot():
     finally:
         loop.close()
         # При завершении сохраняем БД
-        save_database()
+        save_database("Bot shutdown")
 
 
 if __name__ == "__main__":
-    # Загружаем базу из GitHub
+    # Загружаем базу из GitHub (всегда свежую)
     if not init_database():
         print("⚠️ Не удалось загрузить БД, будет создана новая")
+
+    # Запускаем автосохранение
+    if db_sync:
+        backup_thread = threading.Thread(target=scheduled_backup, daemon=True)
+        backup_thread.start()
+        print("✅ Автосохранение запущено (каждые 5 минут)")
 
     # Запускаем Flask в отдельном потоке
     flask_thread = threading.Thread(target=run_flask, daemon=True)
@@ -109,4 +132,6 @@ if __name__ == "__main__":
         run_bot()
     except KeyboardInterrupt:
         print("🛑 Получен сигнал завершения")
-        save_database()
+        global backup_thread_running
+        backup_thread_running = False
+        save_database("Manual shutdown")
