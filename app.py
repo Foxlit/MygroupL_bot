@@ -1,50 +1,71 @@
+#!/usr/bin/env python3
+"""
+Точка входа для Render
+Сначала создаёт БД, потом импортирует и запускает бота
+"""
+
 import os
-import threading
-import subprocess
 import sys
-from flask import Flask
-from bot import main as run_bot
+import subprocess
+import threading
+from pathlib import Path
 
-# Создаём Flask приложение
-app = Flask(__name__)
-
-
-@app.route('/')
-def home():
-    return "Bot is running!", 200
+# Добавляем текущую папку в путь
+sys.path.insert(0, os.path.dirname(__file__))
 
 
-@app.route('/health')
-def health():
-    return "OK", 200
+def init_database():
+    """Создаёт базу данных через init_db.py"""
+    print("🚀 Инициализация базы данных...")
+
+    # Запускаем init_db.py
+    result = subprocess.run(
+        [sys.executable, "scripts/init_db.py"],
+        capture_output=True,
+        text=True,
+        cwd=os.path.dirname(__file__)
+    )
+
+    if result.returncode != 0:
+        print("❌ Ошибка при создании БД:")
+        print(result.stderr)
+        return False
+
+    print("✅ База данных готова")
+    if result.stdout:
+        print(result.stdout)
+    return True
 
 
-def run_bot_thread():
-    """Запускает бота в отдельном потоке"""
-    run_bot()
+def run_bot():
+    """Импортирует и запускает бота (после создания БД)"""
+    print("🚀 Запуск бота...")
+
+    # Теперь импортируем бота
+    from bot import main as bot_main
+    bot_main()
 
 
 if __name__ == "__main__":
-    # Сначала создаём базу данных, если её нет
-    print("🚀 Проверяю базу данных...")
-
-    # Запускаем init_db.py как отдельный процесс
-    result = subprocess.run([sys.executable, "scripts/init_db.py"],
-                            capture_output=True, text=True)
-
-    if result.returncode == 0:
-        print("✅ База данных готова")
-        if result.stdout:
-            print(result.stdout)
-    else:
-        print("❌ Ошибка при создании БД:")
-        print(result.stderr)
+    # Сначала создаём БД
+    if not init_database():
         sys.exit(1)
 
-    # Запускаем бота в фоне
-    bot_thread = threading.Thread(target=run_bot_thread, daemon=True)
+    # Запускаем бота в отдельном потоке
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
 
-    # Запускаем Flask сервер
+    # Запускаем Flask для health check
+    from flask import Flask
+
+    app = Flask(__name__)
+
+
+    @app.route('/')
+    @app.route('/health')
+    def health():
+        return "OK", 200
+
+
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)

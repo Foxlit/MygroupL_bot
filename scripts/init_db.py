@@ -142,27 +142,33 @@ def create_db_module(db_dir):
 """
 
 import sqlite3
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
 
+# Определяем путь к БД
 DB_PATH = Path(__file__).parent / "shared-data" / "bot_data.db"
-
 
 class Database:
     """Класс для работы с базой данных"""
     
     def __init__(self, db_path=None):
         self.db_path = db_path or DB_PATH
-        self._ensure_db_exists()
+        # НЕ вызываем _ensure_db_exists здесь!
+        # База данных будет создана через init_db.py
     
     def _ensure_db_exists(self):
         """Проверяет существование БД"""
         if not self.db_path.exists():
-            raise FileNotFoundError(f"База данных не найдена: {self.db_path}")
+            # Не вызываем ошибку, просто возвращаем False
+            return False
+        return True
     
     def _get_connection(self):
         """Возвращает подключение к БД"""
+        if not self._ensure_db_exists():
+            raise FileNotFoundError(f"База данных не найдена: {self.db_path}")
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
         return conn
