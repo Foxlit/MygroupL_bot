@@ -132,6 +132,6 @@ if __name__ == "__main__":
         run_bot()
     except KeyboardInterrupt:
         print("🛑 Получен сигнал завершения")
-        global backup_thread_running
         backup_thread_running = False
+        global backup_thread_running
         save_database("Manual shutdown")
