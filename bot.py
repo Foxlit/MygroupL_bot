@@ -2418,26 +2418,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ==== АДМИН ПАНЕЛЬ ====
         elif data == "admin_panel":
-            await admin_panel(update, context)
+            await admin_panel(update)
 
         elif data == "admin_whitelist":
-            await admin_whitelist(update, context)
-
-        elif data == "admin_cleanup_links":
-            await admin_cleanup_links(update, context)
+            await admin_whitelist(update)
 
         # ==== ОЧИСТКА ССЫЛОК ====
         elif data == "admin_cleanup_links":
-            await admin_cleanup_links(update, context)
+            await admin_cleanup_links(update)
 
         elif data == "cleanup_old":
-            await cleanup_old_handler(update, context)
+            await cleanup_old_handler(update)
 
         elif data == "cleanup_all":
-            await cleanup_all_handler(update, context)
+            await cleanup_all_handler(update)
 
         elif data == "cleanup_all_confirm":
-            await cleanup_all_confirm_handler(update, context)
+            await cleanup_all_confirm_handler(update)
 
         elif data == "admin_broadcast":
             set_user_state(user_id, 'ADMIN_BROADCAST')
