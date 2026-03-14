@@ -1,5 +1,7 @@
 import os
 import threading
+import subprocess
+import sys
 from flask import Flask
 from bot import main as run_bot
 
@@ -14,7 +16,6 @@ def home():
 
 @app.route('/health')
 def health():
-    """Эндпоинт для проверки здоровья (и для пинга от cron-job.org)"""
     return "OK", 200
 
 
@@ -24,10 +25,26 @@ def run_bot_thread():
 
 
 if __name__ == "__main__":
+    # Сначала создаём базу данных, если её нет
+    print("🚀 Проверяю базу данных...")
+
+    # Запускаем init_db.py как отдельный процесс
+    result = subprocess.run([sys.executable, "scripts/init_db.py"],
+                            capture_output=True, text=True)
+
+    if result.returncode == 0:
+        print("✅ База данных готова")
+        if result.stdout:
+            print(result.stdout)
+    else:
+        print("❌ Ошибка при создании БД:")
+        print(result.stderr)
+        sys.exit(1)
+
     # Запускаем бота в фоне
     bot_thread = threading.Thread(target=run_bot_thread, daemon=True)
     bot_thread.start()
 
-    # Запускаем Flask сервер на порту из окружения Render
+    # Запускаем Flask сервер
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
