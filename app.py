@@ -2,10 +2,15 @@ import os
 import sys
 import asyncio
 import threading
+import time
 from flask import Flask, make_response
+from git_db_sync import GitDatabaseSync
 
 # Создаём Flask приложение
 app = Flask(__name__)
+
+# Глобальный объект для синхронизации
+db_sync = None
 
 
 @app.route('/')
@@ -31,29 +36,43 @@ def run_flask():
 
 
 def init_database():
-    """Создаёт базу данных через init_db.py"""
-    print("🚀 Проверяю базу данных...")
+    """Инициализирует базу данных из GitHub"""
+    global db_sync
 
-    import subprocess
-    result = subprocess.run(
-        [sys.executable, "scripts/init_db.py"],
-        capture_output=True,
-        text=True,
-        cwd=os.path.dirname(__file__)
-    )
+    print("🔄 Синхронизация базы данных с GitHub...")
 
-    if result.returncode != 0:
-        print("❌ Ошибка при создании БД:")
-        print(result.stderr)
+    # Проверяем переменные окружения
+    if not os.environ.get('GITHUB_TOKEN'):
+        print("❌ GITHUB_TOKEN не задан")
         return False
 
-    print("✅ База данных готова")
-    return True
+    if not os.environ.get('GITHUB_REPO'):
+        print("❌ GITHUB_REPO не задан (формат: username/repo)")
+        return False
+
+    # Создаём синхронизатор
+    db_sync = GitDatabaseSync(
+        repo_path=os.path.dirname(__file__),
+        db_path=Path(__file__).parent / "shared-data" / "bot_data.db",
+        branch='data'
+    )
+
+    # Скачиваем базу
+    return db_sync.download_db()
+
+
+def save_database():
+    """Сохраняет базу данных в GitHub"""
+    global db_sync
+    if db_sync:
+        print("💾 Сохраняю базу данных в GitHub...")
+        db_sync.upload_db()
+        db_sync.cleanup()
 
 
 def run_bot():
-    """Запускает бота с собственным event loop в главном потоке"""
-    # Создаём event loop для главного потока
+    """Запускает бота"""
+    # Создаём event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -66,22 +85,24 @@ def run_bot():
         traceback.print_exc()
     finally:
         loop.close()
+        # При завершении сохраняем БД
+        save_database()
 
 
 if __name__ == "__main__":
-    # Сначала создаём БД
+    # Загружаем базу из GitHub
     if not init_database():
-        sys.exit(1)
+        print("⚠️ Не удалось загрузить БД, будет создана новая")
 
     # Запускаем Flask в отдельном потоке
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    # Даём Flask время запуститься
-    import time
-
     time.sleep(2)
 
-    # Запускаем бота в главном потоке с явным event loop
-    print("🚀 Запуск бота в главном потоке...")
-    run_bot()
+    print("🚀 Запуск бота...")
+    try:
+        run_bot()
+    except KeyboardInterrupt:
+        print("🛑 Получен сигнал завершения")
+        save_database()
