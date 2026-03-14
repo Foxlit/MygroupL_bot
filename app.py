@@ -10,8 +10,8 @@ from git_db_sync import GitDatabaseSync
 app = Flask(__name__)
 
 # Глобальный объект для синхронизации
-db_sync = None
 backup_thread_running = False
+db_sync = None
 
 
 @app.route('/')
@@ -111,7 +111,7 @@ def run_bot():
 
 
 if __name__ == "__main__":
-    # Загружаем базу из GitHub (всегда свежую)
+    # Загружаем базу из GitHub
     if not init_database():
         print("⚠️ Не удалось загрузить БД, будет создана новая")
 
