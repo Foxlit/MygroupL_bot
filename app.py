@@ -1,24 +1,42 @@
-#!/usr/bin/env python3
-"""
-Точка входа для Render
-Сначала создаёт БД, потом импортирует и запускает бота
-"""
-
 import os
 import sys
-import subprocess
+import asyncio
 import threading
-from pathlib import Path
+from flask import Flask
 
-# Добавляем текущую папку в путь
-sys.path.insert(0, os.path.dirname(__file__))
+# Создаём Flask приложение
+app = Flask(__name__)
+
+
+@app.route('/')
+@app.route('/health')
+def health():
+    return "OK", 200
+
+
+def run_bot():
+    """Запускает бота в отдельном потоке с собственным event loop"""
+    # Создаём новый event loop для этого потока
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        # Импортируем бота ПОСЛЕ настройки event loop
+        from bot import main as bot_main
+        bot_main()
+    except Exception as e:
+        print(f"❌ Ошибка в боте: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        loop.close()
 
 
 def init_database():
     """Создаёт базу данных через init_db.py"""
-    print("🚀 Инициализация базы данных...")
+    print("🚀 Проверяю базу данных...")
 
-    # Запускаем init_db.py
+    import subprocess
     result = subprocess.run(
         [sys.executable, "scripts/init_db.py"],
         capture_output=True,
@@ -32,18 +50,7 @@ def init_database():
         return False
 
     print("✅ База данных готова")
-    if result.stdout:
-        print(result.stdout)
     return True
-
-
-def run_bot():
-    """Импортирует и запускает бота (после создания БД)"""
-    print("🚀 Запуск бота...")
-
-    # Теперь импортируем бота
-    from bot import main as bot_main
-    bot_main()
 
 
 if __name__ == "__main__":
@@ -51,21 +58,15 @@ if __name__ == "__main__":
     if not init_database():
         sys.exit(1)
 
-    # Запускаем бота в отдельном потоке
+    # Запускаем бота в отдельном потоке с правильным event loop
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
 
-    # Запускаем Flask для health check
-    from flask import Flask
+    # Даём боту время на запуск
+    import time
 
-    app = Flask(__name__)
+    time.sleep(2)
 
-
-    @app.route('/')
-    @app.route('/health')
-    def health():
-        return "OK", 200
-
-
+    # Запускаем Flask сервер
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
