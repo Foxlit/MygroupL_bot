@@ -975,7 +975,7 @@ async def check_homework_reminders_job(context: ContextTypes.DEFAULT_TYPE):
             # Сортируем по количеству дней
             user_reminders.sort(key=lambda x: x['days_left'])
 
-            # Формируем сообщение
+            # Формируем сообщение с датами
             if len(user_reminders) == 1:
                 r = user_reminders[0]
                 message = (
@@ -987,8 +987,11 @@ async def check_homework_reminders_job(context: ContextTypes.DEFAULT_TYPE):
             else:
                 message = "📚 <b>Напоминания о ДЗ</b>\n\n"
                 for r in user_reminders:
-                    message += f"• <b>{r['subject']}</b> — {r['status']}\n"
-                    message += f"  {r['task']}\n\n"
+                    message += (
+                        f"• <b>{r['subject']}</b>\n"
+                        f"  📌 {r['task']}\n"
+                        f"  📅 Срок: {r['due_date']} {r['status']}\n\n"
+                    )
 
             # Отправляем сообщение
             await context.bot.send_message(
