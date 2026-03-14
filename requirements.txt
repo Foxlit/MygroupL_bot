@@ -26,7 +26,6 @@ pyasn1-modules==0.4.2
 pycparser==2.23
 pyparsing==3.3.2
 python-dotenv==1.0.0
-python-telegram-bot==20.7
 pytz==2026.1.post1
 requests==2.32.5
 requests-oauthlib==2.0.0
@@ -38,5 +37,5 @@ tzdata==2025.3
 tzlocal==5.3.1
 uritemplate==4.2.0
 urllib3==2.6.3
-python-telegram-bot[job-queue]==20.7
+python-telegram-bot[job-queue]==21.10
 flask==3.0.3
