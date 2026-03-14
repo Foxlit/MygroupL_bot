@@ -14,22 +14,10 @@ def health():
     return "OK", 200
 
 
-def run_bot():
-    """Запускает бота в отдельном потоке с собственным event loop"""
-    # Создаём новый event loop для этого потока
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    try:
-        # Импортируем бота ПОСЛЕ настройки event loop
-        from bot import main as bot_main
-        bot_main()
-    except Exception as e:
-        print(f"❌ Ошибка в боте: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        loop.close()
+def run_flask():
+    """Запускает Flask сервер в отдельном потоке"""
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, threaded=True)
 
 
 def init_database():
@@ -58,15 +46,24 @@ if __name__ == "__main__":
     if not init_database():
         sys.exit(1)
 
-    # Запускаем бота в отдельном потоке с правильным event loop
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
+    # Запускаем Flask в отдельном потоке
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
 
-    # Даём боту время на запуск
+    # Даём Flask время запуститься
     import time
 
     time.sleep(2)
 
-    # Запускаем Flask сервер
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+    # Запускаем бота в главном потоке (здесь можно работать с сигналами)
+    print("🚀 Запуск бота в главном потоке...")
+
+    try:
+        from bot import main as bot_main
+
+        bot_main()
+    except Exception as e:
+        print(f"❌ Ошибка в боте: {e}")
+        import traceback
+
+        traceback.print_exc()
