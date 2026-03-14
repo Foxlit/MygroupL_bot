@@ -1733,42 +1733,41 @@ async def whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для создания рассылки (перенаправляет в меню)"""
+    """Команда для создания рассылки"""
     user = update.effective_user
     username = user.username or user.first_name
     user_id = user.id
 
     logger.info(f"👑 Админ @{username} вызвал команду /broadcast")
 
-    # Создаём мок-объект callback_query для вызова admin_broadcast
-    class MockQuery:
-        def __init__(self, user_id):
-            self.data = "admin_broadcast"
-            self.from_user = type('User', (), {'id': user_id})()
-            self.message = type('Message', (), {
-                'chat_id': update.message.chat_id,
-                'message_id': None
-            })()
+    # Устанавливаем состояние
+    context.user_data['awaiting_broadcast'] = True
+    context.user_data['broadcast_step'] = 'waiting_message'
 
-        async def answer(self):
-            pass
+    # Отправляем сообщение с инструкцией (как в admin_broadcast)
+    keyboard = [[InlineKeyboardButton("❌ Отменить", callback_data="broadcast_cancel_confirm")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
-        async def edit_message_text(self, text, parse_mode=None, reply_markup=None, disable_web_page_preview=None):
-            # Вместо редактирования отправляем новое сообщение
-            return await update.message.reply_text(
-                text,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup,
-                disable_web_page_preview=disable_web_page_preview
-            )
+    await update.message.reply_text(
+        "📢 <b>Создание рассылки - Шаг 1/2</b>\n\n"
+        "✍️ <b>Введите текст рассылки</b>\n\n"
+        "Вы можете использовать HTML-разметку:\n"
+        f"• <code>&lt;b&gt;текст&lt;/b&gt;</code> - жирный\n"
+        f"• <code>&lt;i&gt;текст&lt;/i&gt;</code> - курсив\n"
+        f"• <code>&lt;u&gt;текст&lt;/u&gt;</code> - подчёркнутый\n"
+        f"• <code>&lt;s&gt;текст&lt;/s&gt;</code> - зачёркнутый\n"
+        f"• <code>&lt;a href=\"ссылка\"&gt;текст&lt;/a&gt;</code> - ссылка\n"
+        f"• <code>&lt;code&gt;текст&lt;/code&gt;</code> - моноширинный\n"
+        f"• <code>&lt;pre&gt;текст&lt;/pre&gt;</code> - блок кода\n"
+        f"• <code>&lt;tg-spoilere&gt;текст&lt;/tg-spoiler&gt;</code> - скрытый текст\n\n"
+        "📝 Просто напишите сообщение в этот чат.\n"
+        "Я его запомню и покажу предпросмотр.\n\n"
+        "Для отмены напишите /cancel или нажмите кнопку ниже",
+        parse_mode="HTML",
+        reply_markup=reply_markup
+    )
 
-    # Создаём мок и вызываем обработчик
-    mock_query = MockQuery(user_id)
-    update.callback_query = mock_query
-
-    # Вызываем существующий обработчик admin_broadcast
-    from bot import button_handler
-    await button_handler(update, context)
+    set_user_state(user_id, 'ADMIN_BROADCAST')
 
 
 @admin_only
@@ -1796,7 +1795,6 @@ async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         "• <code>/removeuser &lt;id&gt;</code> или <code>/ru &lt;id&gt;</code>- удалить пользователя\n"
         "• <code>/broadcast &lt;текст&gt;</code> или <code>/bc &lt;текст&gt;</code>"
         " - массовая рассылка авторизованным пользователям\n\n"
-        "<b>Навигация:</b>"
     )
 
     keyboard = [
