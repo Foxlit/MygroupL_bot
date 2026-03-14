@@ -3,6 +3,7 @@ import sys
 import asyncio
 import threading
 import time
+from pathlib import Path
 from flask import Flask, make_response
 from git_db_sync import GitDatabaseSync
 
@@ -49,6 +50,9 @@ def init_database():
     if not os.environ.get('GITHUB_REPO'):
         print("❌ GITHUB_REPO не задан (формат: username/repo)")
         return False
+
+    # Создаём папку shared-data, если её нет
+    Path(__file__).parent.joinpath("shared-data").mkdir(exist_ok=True)
 
     # Создаём синхронизатор
     db_sync = GitDatabaseSync(
